@@ -1824,6 +1824,42 @@ func buildConversationID(modelID, systemPrompt, anchor string) string {
 	return uuid.NewSHA1(uuid.NameSpaceURL, []byte(seed)).String()
 }
 
+// ResolveClaudeConversationID returns a deterministic conversation key for
+// affinity routing. Returns "" for synthetic/absent anchors (skip affinity).
+// Does NOT change buildConversationID's upstream-facing behavior.
+func ResolveClaudeConversationID(req *ClaudeRequest) string {
+	if req == nil {
+		return ""
+	}
+	anchor := firstClaudeConversationAnchor(req.Messages)
+	if isSyntheticConversationAnchor(anchor) {
+		return ""
+	}
+	return buildConversationID(req.Model, extractSystemPrompt(req.System), anchor)
+}
+
+// ResolveOpenAIConversationID returns a deterministic conversation key for
+// affinity routing. Returns "" for synthetic/absent anchors.
+func ResolveOpenAIConversationID(req *OpenAIRequest) string {
+	if req == nil {
+		return ""
+	}
+	var nonSystem []OpenAIMessage
+	var systemText string
+	for _, m := range req.Messages {
+		if m.Role == "system" {
+			systemText += extractOpenAIMessageText(m.Content)
+			continue
+		}
+		nonSystem = append(nonSystem, m)
+	}
+	anchor := firstOpenAIConversationAnchor(nonSystem)
+	if isSyntheticConversationAnchor(anchor) {
+		return ""
+	}
+	return buildConversationID(req.Model, systemText, anchor)
+}
+
 func isSyntheticConversationAnchor(anchor string) bool {
 	if strings.TrimSpace(anchor) == "" {
 		return true

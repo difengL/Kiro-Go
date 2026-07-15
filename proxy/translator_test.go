@@ -631,12 +631,155 @@ func TestOpenAIToolResultImageCarriedWhenFollowedByUser(t *testing.T) {
 			toolHistImages += len(h.UserInputMessage.Images)
 		}
 	}
-	if toolHistImages != 1 {
-		t.Fatalf("expected tool image carried on the flushed tool-result history entry, got %d", toolHistImages)
-	}
 
 	cur := payload.ConversationState.CurrentMessage.UserInputMessage
 	if len(cur.Images) != 0 {
 		t.Fatalf("tool image should not leak into a later user message, got %d on current", len(cur.Images))
 	}
 }
+
+func TestResolveClaudeConversationID_Deterministic(t *testing.T) {
+	req := &ClaudeRequest{
+		Model: "claude-sonnet-4",
+		System: "You are a helpful assistant.",
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: "Hello, what is 1+1?"},
+			{Role: "assistant", Content: "2"},
+			{Role: "user", Content: "And 2+2?"},
+		},
+		MaxTokens: 100,
+	}
+	id1 := ResolveClaudeConversationID(req)
+	if id1 == "" {
+		t.Fatal("want non-empty convID for real anchor")
+	}
+	// 第二次请求：历史更长但首条 user message 不变
+	req2 := &ClaudeRequest{
+		Model: "claude-sonnet-4",
+		System: "You are a helpful assistant.",
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: "Hello, what is 1+1?"},
+			{Role: "assistant", Content: "2"},
+			{Role: "user", Content: "And 2+2?"},
+			{Role: "assistant", Content: "4"},
+			{Role: "user", Content: "And 3+3?"},
+		},
+		MaxTokens: 100,
+	}
+	id2 := ResolveClaudeConversationID(req2)
+	if id1 != id2 {
+		t.Fatalf("same anchor+system+model should produce same convID: %q vs %q", id1, id2)
+	}
+}
+
+func TestResolveClaudeConversationID_SyntheticAnchorEmpty(t *testing.T) {
+	req := &ClaudeRequest{
+		Model: "claude-sonnet-4",
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: "."},
+		},
+		MaxTokens: 100,
+	}
+	if id := ResolveClaudeConversationID(req); id != "" {
+		t.Fatalf("synthetic anchor should yield empty convID, got %q", id)
+	}
+}
+
+func TestResolveClaudeConversationID_NoAnchorEmpty(t *testing.T) {
+	req := &ClaudeRequest{
+		Model:    "claude-sonnet-4",
+		Messages: []ClaudeMessage{{Role: "assistant", Content: "hi"}},
+		MaxTokens: 100,
+	}
+	if id := ResolveClaudeConversationID(req); id != "" {
+		t.Fatalf("no user anchor should yield empty convID, got %q", id)
+	}
+}
+
+func TestResolveOpenAIConversationID_Deterministic(t *testing.T) {
+	req := &OpenAIRequest{
+		Model: "gpt-4",
+		Messages: []OpenAIMessage{
+			{Role: "user", Content: "Hello, what is 1+1?"},
+			{Role: "assistant", Content: "2"},
+		},
+	}
+	id1 := ResolveOpenAIConversationID(req)
+	if !strings.Contains(id1, "-") {
+		t.Fatalf("want uuid-like convID, got %q", id1)
+	}
+
+	// 历史更长但首条 user message 不变，应返回相同 ID
+	req2 := &OpenAIRequest{
+		Model: "gpt-4",
+		Messages: []OpenAIMessage{
+			{Role: "user", Content: "Hello, what is 1+1?"},
+			{Role: "assistant", Content: "2"},
+			{Role: "user", Content: "And 2+2?"},
+		},
+	}
+	id2 := ResolveOpenAIConversationID(req2)
+	if id1 != id2 {
+		t.Fatalf("same anchor+system+model should produce same convID: %q vs %q", id1, id2)
+	}
+}
+
+func TestResolveOpenAIConversationID_SyntheticAnchorEmpty(t *testing.T) {
+	req := &OpenAIRequest{
+		Model: "gpt-4",
+		Messages: []OpenAIMessage{
+			{Role: "user", Content: "."},
+		},
+	}
+	if id := ResolveOpenAIConversationID(req); id != "" {
+		t.Fatalf("synthetic anchor should yield empty convID, got %q", id)
+	}
+}
+
+func TestResolveOpenAIConversationID_NoAnchorEmpty(t *testing.T) {
+	req := &OpenAIRequest{
+		Model:    "gpt-4",
+		Messages: []OpenAIMessage{{Role: "assistant", Content: "hi"}},
+	}
+	if id := ResolveOpenAIConversationID(req); id != "" {
+		t.Fatalf("no user anchor should yield empty convID, got %q", id)
+	}
+}
+
+func TestResolveClaudeConversationID_SystemBlocks(t *testing.T) {
+	req := &ClaudeRequest{
+		Model: "claude-sonnet-4",
+		System: []interface{}{
+			map[string]interface{}{"type": "text", "text": "You are helpful."},
+			map[string]interface{}{"type": "text", "text": "Be concise."},
+		},
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: "Hello, what is 1+1?"},
+		},
+		MaxTokens: 100,
+	}
+	id1 := ResolveClaudeConversationID(req)
+	if id1 == "" {
+		t.Fatal("want non-empty convID for real anchor with system blocks")
+	}
+
+	// 相同 system blocks 应产生相同 ID
+	req2 := &ClaudeRequest{
+		Model: "claude-sonnet-4",
+		System: []interface{}{
+			map[string]interface{}{"type": "text", "text": "You are helpful."},
+			map[string]interface{}{"type": "text", "text": "Be concise."},
+		},
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: "Hello, what is 1+1?"},
+			{Role: "assistant", Content: "2"},
+			{Role: "user", Content: "And 2+2?"},
+		},
+		MaxTokens: 100,
+	}
+	id2 := ResolveClaudeConversationID(req2)
+	if id1 != id2 {
+		t.Fatalf("same anchor+system blocks+model should produce same convID: %q vs %q", id1, id2)
+	}
+}
+

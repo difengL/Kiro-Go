@@ -884,9 +884,9 @@ func UpdateAffinitySettings(enabled bool, ttlMinutes int) error {
 		ttlMinutes = 5
 	}
 	cfgLock.Lock()
+	defer cfgLock.Unlock()
 	cfg.AffinityEnabled = enabled
 	cfg.AffinityTTLMinutes = ttlMinutes
-	cfgLock.Unlock()
 	return Save()
 }
 

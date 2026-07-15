@@ -174,6 +174,13 @@ type Config struct {
 	// solely because usageCurrent >= usageLimit.
 	AllowOverUsage bool `json:"allowOverUsage,omitempty"`
 
+	// AffinityEnabled enables session affinity: same ConversationID routes to the
+	// same account to hit prompt cache. Default true.
+	AffinityEnabled bool `json:"affinityEnabled,omitempty"`
+	// AffinityTTLMinutes is how long a conversation→account binding stays alive
+	// without activity. Clamped to [1,60], default 5.
+	AffinityTTLMinutes int `json:"affinityTTLMinutes,omitempty"`
+
 	// Proxy configuration: optional outbound proxy for Kiro API requests
 	// Format: "socks5://host:port", "socks5://user:pass@host:port",
 	//         "http://host:port",  "http://user:pass@host:port"
@@ -834,6 +841,52 @@ func UpdateAllowOverUsage(allow bool) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.AllowOverUsage = allow
+	return Save()
+}
+
+// applyAffinityDefaults fills affinity defaults for zero-value fields.
+func applyAffinityDefaults(c *Config) {
+	if !c.AffinityEnabled && c.AffinityTTLMinutes == 0 {
+		// When both fields are zero, the config was not explicitly set,
+		// so apply defaults: enabled=true, TTL=5.
+		c.AffinityEnabled = true
+		c.AffinityTTLMinutes = 5
+	}
+}
+
+// GetAffinityEnabled returns whether session affinity is enabled. Defaults to true.
+func GetAffinityEnabled() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || (!cfg.AffinityEnabled && cfg.AffinityTTLMinutes == 0) {
+		return true // nil or unconfigured defaults to enabled
+	}
+	return cfg.AffinityEnabled
+}
+
+// GetAffinityTTLMinutes returns the affinity TTL in minutes, clamped to [1,60]. Default 5.
+func GetAffinityTTLMinutes() int {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return 5
+	}
+	v := cfg.AffinityTTLMinutes
+	if v < 1 || v > 60 {
+		return 5
+	}
+	return v
+}
+
+// UpdateAffinitySettings updates affinity settings and persists the change.
+func UpdateAffinitySettings(enabled bool, ttlMinutes int) error {
+	if ttlMinutes < 1 || ttlMinutes > 60 {
+		ttlMinutes = 5
+	}
+	cfgLock.Lock()
+	cfg.AffinityEnabled = enabled
+	cfg.AffinityTTLMinutes = ttlMinutes
+	cfgLock.Unlock()
 	return Save()
 }
 

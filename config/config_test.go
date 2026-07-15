@@ -127,3 +127,51 @@ func TestAccountAllowOverageMigration(t *testing.T) {
 		}
 	}
 }
+
+// --- Session Affinity Tests ---
+
+func TestAffinityDefaults(t *testing.T) {
+	c := &Config{}
+	applyAffinityDefaults(c)
+	if !c.AffinityEnabled {
+		t.Fatalf("AffinityEnabled default want true")
+	}
+	if c.AffinityTTLMinutes != 5 {
+		t.Fatalf("AffinityTTLMinutes default want 5, got %d", c.AffinityTTLMinutes)
+	}
+}
+
+func TestGetAffinityTTLMinutesClamps(t *testing.T) {
+	// Directly set the singleton so the getter reads it.
+	cfgLock.Lock()
+	cfg = &Config{AffinityEnabled: true, AffinityTTLMinutes: 0}
+	cfgLock.Unlock()
+	if got := GetAffinityTTLMinutes(); got != 5 {
+		t.Fatalf("ttl 0 -> want 5, got %d", got)
+	}
+	cfgLock.Lock()
+	cfg.AffinityTTLMinutes = 120
+	cfgLock.Unlock()
+	if got := GetAffinityTTLMinutes(); got != 5 {
+		t.Fatalf("ttl 120 -> want 5, got %d", got)
+	}
+	cfgLock.Lock()
+	cfg.AffinityTTLMinutes = 30
+	cfgLock.Unlock()
+	if got := GetAffinityTTLMinutes(); got != 30 {
+		t.Fatalf("ttl 30 -> want 30, got %d", got)
+	}
+	// Restore clean state
+	cfgLock.Lock()
+	cfg = nil
+	cfgLock.Unlock()
+}
+
+func TestGetAffinityEnabledDefaultTrue(t *testing.T) {
+	cfgLock.Lock()
+	cfg = nil // trigger default
+	cfgLock.Unlock()
+	if !GetAffinityEnabled() {
+		t.Fatalf("GetAffinityEnabled nil config want true")
+	}
+}

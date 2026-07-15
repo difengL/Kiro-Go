@@ -626,10 +626,13 @@ func TestOpenAIToolResultImageCarriedWhenFollowedByUser(t *testing.T) {
 
 	var toolHistImages int
 	for _, h := range payload.ConversationState.History {
-		if h.UserInputMessage != nil && h.UserInputMessage.UserInputMessageContext != nil &&
-			len(h.UserInputMessage.UserInputMessageContext.ToolResults) > 0 {
+		if h.UserInputMessage != nil {
 			toolHistImages += len(h.UserInputMessage.Images)
 		}
+	}
+
+	if toolHistImages != 1 {
+		t.Fatalf("expected tool image carried on the flushed tool-result history entry, got %d", toolHistImages)
 	}
 
 	cur := payload.ConversationState.CurrentMessage.UserInputMessage

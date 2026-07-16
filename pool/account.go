@@ -265,6 +265,53 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 	return best
 }
 
+// SelectForConversation 选择账号：先亲和命中，否则加权轮询。
+// convID 为空时退化为 GetNextForModelExcluding（兼容合成锚点）。
+// 亲和命中但账号不可用时，自动迁移到轮询选出的新号。
+// 绑定由 handler 在请求成功后调 Remember 完成。
+func (p *AccountPool) SelectForConversation(convID, model string, excluded map[string]bool) *config.Account {
+	// 亲和未启用或空 key：直接轮询
+	if !config.GetAffinityEnabled() || convID == "" {
+		return p.GetNextForModelExcluding(model, excluded)
+	}
+
+	now := time.Now()
+
+	// 1. 查亲和（affinity 独立锁，不持 p.mu）
+	if boundID, ok := p.affinity.lookup(convID, now); ok {
+		// 2. 命中：校验该账号当前可用（需持 p.mu.RLock）
+		p.mu.RLock()
+		acc := p.getAccountByIDLocked(boundID)
+		usable := acc != nil && p.isAccountUsable(acc, model, excluded, now)
+		p.mu.RUnlock()
+		if usable {
+			return acc // 亲和命中，cache 窗口成立
+		}
+		// 不可用：迁移，落 to 轮询
+	}
+	// 3. 轮询
+	return p.GetNextForModelExcluding(model, excluded)
+}
+
+// Remember 在请求成功后绑定 convID→accountID，刷新 lastUsed。
+// convID 为空时直接返回（安全阀）。
+func (p *AccountPool) Remember(convID, accountID string) {
+	if !config.GetAffinityEnabled() || convID == "" {
+		return
+	}
+	p.affinity.remember(convID, accountID, time.Now())
+}
+
+// getAccountByIDLocked 在已持有 p.mu.RLock 时按 ID 查账号。
+func (p *AccountPool) getAccountByIDLocked(id string) *config.Account {
+	for i := range p.accounts {
+		if p.accounts[i].ID == id {
+			return &p.accounts[i]
+		}
+	}
+	return nil
+}
+
 // GetByID 根据 ID 获取账号
 func (p *AccountPool) GetByID(id string) *config.Account {
 	p.mu.RLock()

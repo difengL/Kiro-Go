@@ -383,3 +383,65 @@ func TestIsAccountUsable_TokenExpiringSoon(t *testing.T) {
 		t.Fatal("account expiring within 120s should not be usable")
 	}
 }
+
+func TestSelectForConversation_EmptyKeyDegradesToRoundRobin(t *testing.T) {
+	a1 := config.Account{ID: "a1", Enabled: true, ExpiresAt: futureExpiry()}
+	a2 := config.Account{ID: "a2", Enabled: true, ExpiresAt: futureExpiry()}
+	p := newTestPoolWithAffinity([]config.Account{a1, a2})
+	acc := p.SelectForConversation("", "claude-sonnet-4", nil)
+	if acc == nil {
+		t.Fatal("empty key should still return an account via round-robin")
+	}
+}
+
+func TestSelectForConversation_AffinityHitReturnsSameAccount(t *testing.T) {
+	a1 := config.Account{ID: "a1", Enabled: true, ExpiresAt: futureExpiry()}
+	a2 := config.Account{ID: "a2", Enabled: true, ExpiresAt: futureExpiry()}
+	p := newTestPoolWithAffinity([]config.Account{a1, a2})
+	first := p.SelectForConversation("conv1", "claude-sonnet-4", nil)
+	if first == nil {
+		t.Fatal("first select nil")
+	}
+	p.Remember("conv1", first.ID)
+	second := p.SelectForConversation("conv1", "claude-sonnet-4", nil)
+	if second == nil || second.ID != first.ID {
+		t.Fatalf("affinity hit: want %q, got %q", first.ID, second.ID)
+	}
+}
+
+func TestSelectForConversation_MigratesWhenBoundAccountCooledDown(t *testing.T) {
+	a1 := config.Account{ID: "a1", Enabled: true, ExpiresAt: futureExpiry()}
+	a2 := config.Account{ID: "a2", Enabled: true, ExpiresAt: futureExpiry()}
+	p := newTestPoolWithAffinity([]config.Account{a1, a2})
+	p.Remember("conv1", "a1")
+	p.cooldowns["a1"] = time.Now().Add(10 * time.Minute) // a1 冷却
+	acc := p.SelectForConversation("conv1", "claude-sonnet-4", nil)
+	if acc == nil {
+		t.Fatal("should migrate")
+	}
+	if acc.ID == "a1" {
+		t.Fatal("should not return cooled-down a1")
+	}
+}
+
+func TestSelectForConversation_MigratesWhenExcluded(t *testing.T) {
+	a1 := config.Account{ID: "a1", Enabled: true, ExpiresAt: futureExpiry()}
+	a2 := config.Account{ID: "a2", Enabled: true, ExpiresAt: futureExpiry()}
+	p := newTestPoolWithAffinity([]config.Account{a1, a2})
+	p.Remember("conv1", "a1")
+	acc := p.SelectForConversation("conv1", "claude-sonnet-4", map[string]bool{"a1": true})
+	if acc == nil || acc.ID == "a1" {
+		t.Fatalf("should migrate off excluded a1, got %v", acc)
+	}
+}
+
+func TestRemember_NoOpOnEmptyKey(t *testing.T) {
+	p := newTestPoolWithAffinity(nil)
+	p.Remember("", "a1")
+	if id, ok := p.affinity.lookup("", time.Now()); ok || id != "" {
+		t.Fatal("empty key must not bind")
+	}
+}
+
+// helper
+func futureExpiry() int64 { return time.Now().Add(1 * time.Hour).Unix() }

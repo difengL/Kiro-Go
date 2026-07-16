@@ -21,6 +21,7 @@ type AccountPool struct {
 	cooldowns     map[string]time.Time       // 账号冷却时间
 	errorCounts   map[string]int             // 连续错误计数
 	modelLists    map[string]map[string]bool // accountID → set of modelIDs (from ListAvailableModels)
+	affinity      *affinityRouter            // 会话亲和映射（独立锁，不与 mu 嵌套）
 }
 
 var (
@@ -35,6 +36,7 @@ func GetPool() *AccountPool {
 			cooldowns:   make(map[string]time.Time),
 			errorCounts: make(map[string]int),
 			modelLists:  make(map[string]map[string]bool),
+			affinity:    newAffinityRouter(time.Duration(config.GetAffinityTTLMinutes()) * time.Minute),
 		}
 		pool.Reload()
 	})
@@ -63,6 +65,9 @@ func (p *AccountPool) Reload() {
 	}
 	p.accounts = weighted
 	p.totalAccounts = len(enabled)
+	if p.affinity != nil {
+		p.affinity.setTTL(time.Duration(config.GetAffinityTTLMinutes()) * time.Minute)
+	}
 }
 
 // GetNext 获取下一个可用账号（加权轮询）
@@ -185,6 +190,30 @@ func (p *AccountPool) GetNextForModel(model string) *config.Account {
 	return p.GetNextForModelExcluding(model, nil)
 }
 
+// isAccountUsable 判断账号当前是否可用于选号。
+// 必须在持有 p.mu.RLock 时调用。亲和命中分支与轮询分支共用此判定。
+func (p *AccountPool) isAccountUsable(acc *config.Account, model string, excluded map[string]bool, now time.Time) bool {
+	if acc == nil {
+		return false
+	}
+	if excluded != nil && excluded[acc.ID] {
+		return false
+	}
+	if !p.accountHasModel(acc.ID, model) {
+		return false
+	}
+	if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
+		return false
+	}
+	if acc.ExpiresAt > 0 && now.Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds {
+		return false
+	}
+	if isQuotaBlocked(*acc, config.GetAllowOverUsage()) {
+		return false
+	}
+	return true
+}
+
 // GetNextForModelExcluding 获取下一个支持指定模型的可用账号，并跳过指定账号。
 func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string]bool) *config.Account {
 	p.mu.RLock()
@@ -203,26 +232,7 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 		idx := atomic.AddUint64(&p.currentIndex, 1) % uint64(n)
 		acc := &p.accounts[idx]
 
-		if excluded != nil && excluded[acc.ID] {
-			seen[acc.ID] = true
-			continue
-		}
-		if seen[acc.ID] {
-			continue
-		}
-		if !p.accountHasModel(acc.ID, model) {
-			seen[acc.ID] = true
-			continue
-		}
-		if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
-			seen[acc.ID] = true
-			continue
-		}
-		if acc.ExpiresAt > 0 && time.Now().Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds {
-			seen[acc.ID] = true
-			continue
-		}
-		if isQuotaBlocked(*acc, allowOverUsage) {
+		if !p.isAccountUsable(acc, model, excluded, now) {
 			seen[acc.ID] = true
 			continue
 		}

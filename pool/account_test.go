@@ -325,3 +325,61 @@ func TestReloadDropsOverQuotaAccountWhenAllowOverUsageDisabled(t *testing.T) {
 		t.Fatalf("expected over-quota account to be dropped, got %q", got.ID)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// isAccountUsable
+// ---------------------------------------------------------------------------
+
+func newTestPoolWithAffinity(accounts []config.Account) *AccountPool {
+	p := &AccountPool{
+		accounts:   accounts,
+		cooldowns:  make(map[string]time.Time),
+		errorCounts: make(map[string]int),
+		modelLists: make(map[string]map[string]bool),
+		affinity:   newAffinityRouter(5 * time.Minute),
+	}
+	p.totalAccounts = len(accounts)
+	return p
+}
+
+func TestIsAccountUsable_HappyPath(t *testing.T) {
+	acc := config.Account{ID: "a1", Enabled: true, ExpiresAt: time.Now().Add(1 * time.Hour).Unix()}
+	p := newTestPoolWithAffinity([]config.Account{acc})
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if !p.isAccountUsable(&acc, "claude-sonnet-4", nil, time.Now()) {
+		t.Fatal("fresh enabled account should be usable")
+	}
+}
+
+func TestIsAccountUsable_Excluded(t *testing.T) {
+	acc := config.Account{ID: "a1", Enabled: true, ExpiresAt: time.Now().Add(1 * time.Hour).Unix()}
+	p := newTestPoolWithAffinity([]config.Account{acc})
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	excluded := map[string]bool{"a1": true}
+	if p.isAccountUsable(&acc, "claude-sonnet-4", excluded, time.Now()) {
+		t.Fatal("excluded account should not be usable")
+	}
+}
+
+func TestIsAccountUsable_Cooldown(t *testing.T) {
+	acc := config.Account{ID: "a1", Enabled: true, ExpiresAt: time.Now().Add(1 * time.Hour).Unix()}
+	p := newTestPoolWithAffinity([]config.Account{acc})
+	p.cooldowns["a1"] = time.Now().Add(10 * time.Minute)
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.isAccountUsable(&acc, "claude-sonnet-4", nil, time.Now()) {
+		t.Fatal("cooled-down account should not be usable")
+	}
+}
+
+func TestIsAccountUsable_TokenExpiringSoon(t *testing.T) {
+	acc := config.Account{ID: "a1", Enabled: true, ExpiresAt: time.Now().Add(60 * time.Second).Unix()}
+	p := newTestPoolWithAffinity([]config.Account{acc})
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.isAccountUsable(&acc, "claude-sonnet-4", nil, time.Now()) {
+		t.Fatal("account expiring within 120s should not be usable")
+	}
+}

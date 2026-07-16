@@ -31,15 +31,16 @@ var (
 
 // GetPool 获取全局账号池单例
 func GetPool() *AccountPool {
-	poolOnce.Do(func() {
-		pool = &AccountPool{
-			cooldowns:   make(map[string]time.Time),
-			errorCounts: make(map[string]int),
-			modelLists:  make(map[string]map[string]bool),
-			affinity:    newAffinityRouter(time.Duration(config.GetAffinityTTLMinutes()) * time.Minute),
-		}
-		pool.Reload()
-	})
+		poolOnce.Do(func() {
+			pool = &AccountPool{
+				cooldowns:   make(map[string]time.Time),
+				errorCounts: make(map[string]int),
+				modelLists:  make(map[string]map[string]bool),
+				affinity:    newAffinityRouter(time.Duration(config.GetAffinityTTLMinutes()) * time.Minute),
+			}
+			pool.Reload()
+			go pool.backgroundCleanupAffinity()
+		})
 	return pool
 }
 
@@ -67,6 +68,18 @@ func (p *AccountPool) Reload() {
 	p.totalAccounts = len(enabled)
 	if p.affinity != nil {
 		p.affinity.setTTL(time.Duration(config.GetAffinityTTLMinutes()) * time.Minute)
+	}
+}
+
+// backgroundCleanupAffinity 定期清理过期的亲和映射条目。
+// 每分钟执行一次，仅持 affinityRouter.mu（独立锁），不碰 AccountPool.mu。
+func (p *AccountPool) backgroundCleanupAffinity() {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		if p.affinity != nil {
+			p.affinity.cleanup(time.Now())
+		}
 	}
 }
 

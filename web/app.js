@@ -1649,7 +1649,7 @@
     const affinityEnabled = $('affinityEnabled').checked;
     const affinityTTLMinutes = parseInt($('affinityTTLMinutes').value) || 5;
     await api('/settings', { method: 'POST', body: JSON.stringify({ affinityEnabled, affinityTTLMinutes }) });
-    toast('亲和性设置已保存', 'success');
+    toast(t('settings.affinitySaved'), 'success');
   }
   async function changePassword() {
     const np = $('newPassword').value;
@@ -2817,6 +2817,7 @@
   function bindSettingsEvents() {
     $('saveRequireApiKeyBtn').addEventListener('click', saveRequireApiKey);
     $('saveOverUsageBtn').addEventListener('click', saveOverUsageConfig);
+    $('saveAffinityBtn').addEventListener('click', saveAffinityConfig);
     $('saveThinkingBtn').addEventListener('click', saveThinkingConfig);
     $('saveEndpointBtn').addEventListener('click', saveEndpointConfig);
     $('changePasswordBtn').addEventListener('click', changePassword);

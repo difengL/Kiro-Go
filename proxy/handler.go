@@ -1255,6 +1255,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
+		h.pool.Remember(convID, account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
 		h.recordSuccessLog("claude", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
@@ -1517,6 +1518,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
+		h.pool.Remember(convID, account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
 		h.recordSuccessLog("claude", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
@@ -3014,6 +3016,8 @@ func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 		"port":           config.GetPort(),
 		"host":           config.GetHost(),
 		"allowOverUsage": config.GetAllowOverUsage(),
+		"affinityEnabled":    config.GetAffinityEnabled(),
+		"affinityTTLMinutes": config.GetAffinityTTLMinutes(),
 	})
 }
 
@@ -3089,6 +3093,25 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// Rebuild the pool so over-quota accounts are re-included or dropped immediately.
+		h.pool.Reload()
+	}
+
+	// 更新会话亲和性设置
+	if req.AffinityEnabled != nil || req.AffinityTTLMinutes != nil {
+		enabled := config.GetAffinityEnabled()
+		if req.AffinityEnabled != nil {
+			enabled = *req.AffinityEnabled
+		}
+		ttl := config.GetAffinityTTLMinutes()
+		if req.AffinityTTLMinutes != nil {
+			ttl = *req.AffinityTTLMinutes
+		}
+		if err := config.UpdateAffinitySettings(enabled, ttl); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		// Reload 让 affinityRouter 的 TTL 立即按新值生效。
 		h.pool.Reload()
 	}
 

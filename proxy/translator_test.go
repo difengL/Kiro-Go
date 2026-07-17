@@ -526,6 +526,13 @@ func TestClaudeToolResultMixedTextAndImage(t *testing.T) {
 	req := &ClaudeRequest{
 		Model: "claude-opus-4.8",
 		Messages: []ClaudeMessage{
+			{Role: "user", Content: "take a screenshot"},
+			{
+				Role: "assistant",
+				Content: []interface{}{
+					map[string]interface{}{"type": "tool_use", "id": "tool_2", "name": "screenshot", "input": map[string]interface{}{}},
+				},
+			},
 			{
 				Role: "user",
 				Content: []interface{}{

@@ -1535,6 +1535,8 @@
     const d = await res.json();
     $('requireApiKey').checked = d.requireApiKey;
     $('allowOverUsage').checked = d.allowOverUsage || false;
+    $('affinityEnabled').checked = d.affinityEnabled !== false;
+    $('affinityTTLMinutes').value = d.affinityTTLMinutes || 5;
     await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadApiKeys()]);
     refreshCustomSelects();
   }
@@ -1642,6 +1644,12 @@
     const allowOverUsage = $('allowOverUsage').checked;
     await api('/settings', { method: 'POST', body: JSON.stringify({ allowOverUsage }) });
     toast(t('settings.overUsageSaved'), 'success');
+  }
+  async function saveAffinityConfig() {
+    const affinityEnabled = $('affinityEnabled').checked;
+    const affinityTTLMinutes = parseInt($('affinityTTLMinutes').value) || 5;
+    await api('/settings', { method: 'POST', body: JSON.stringify({ affinityEnabled, affinityTTLMinutes }) });
+    toast('亲和性设置已保存', 'success');
   }
   async function changePassword() {
     const np = $('newPassword').value;

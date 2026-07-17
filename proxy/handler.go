@@ -3066,6 +3066,8 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		RequireApiKey  *bool   `json:"requireApiKey,omitempty"`
 		Password       string  `json:"password,omitempty"`
 		AllowOverUsage *bool   `json:"allowOverUsage,omitempty"`
+		AffinityEnabled    *bool `json:"affinityEnabled,omitempty"`
+		AffinityTTLMinutes *int  `json:"affinityTTLMinutes,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)

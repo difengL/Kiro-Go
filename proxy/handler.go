@@ -836,7 +836,7 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 
 	// Stream or non-stream
 	apiKeyID := apiKeyIDFromContext(r.Context())
-	convID := ResolveClaudeConversationID(&req)
+	convID := ResolveClaudeConversationID(r, &req)
 	if req.Stream {
 		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, convID)
 	} else {
@@ -895,7 +895,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			h.failAccount(convID, account, err)
 			continue
 		}
 		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
@@ -1220,7 +1220,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		if err != nil {
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			h.failAccount(convID, account, err)
 			if !messageStarted {
 				continue
 			}
@@ -1456,7 +1456,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			h.failAccount(convID, account, err)
 			continue
 		}
 		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
@@ -1495,7 +1495,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		if err != nil {
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			h.failAccount(convID, account, err)
 			continue
 		}
 
@@ -1607,7 +1607,7 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(&req)
 
 	kiroPayload := OpenAIToKiro(&req, thinking)
-	convID := ResolveOpenAIConversationID(&req)
+	convID := ResolveOpenAIConversationID(r, &req)
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	if req.Stream {
@@ -1645,7 +1645,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			h.failAccount(convID, account, err)
 			continue
 		}
 
@@ -1934,7 +1934,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		if err != nil {
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			h.failAccount(convID, account, err)
 			if !responseStarted {
 				continue
 			}
@@ -2023,7 +2023,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			h.failAccount(convID, account, err)
 			continue
 		}
 
@@ -2054,7 +2054,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		if err != nil {
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			h.failAccount(convID, account, err)
 			continue
 		}
 

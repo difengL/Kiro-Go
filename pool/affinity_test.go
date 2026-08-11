@@ -94,3 +94,26 @@ func TestAffinity_LookupRefreshDoesNotResetTTL(t *testing.T) {
 		t.Fatalf("lookup should not refresh TTL; expected expiry, got id=%q ok=%v", id, ok)
 	}
 }
+
+func TestAffinity_UnbindRemovesBinding(t *testing.T) {
+	a := newAffinityRouter(5 * time.Minute)
+	now := time.Now()
+	a.remember("conv1", "acc1", now)
+	a.unbind("conv1")
+	if id, ok := a.lookup("conv1", now); ok || id != "" {
+		t.Fatalf("unbind should remove binding, got id=%q ok=%v", id, ok)
+	}
+	// 空 key 是安全阀，不应 panic
+	a.unbind("")
+}
+
+func TestAffinity_UnbindNoOpOnMissingKey(t *testing.T) {
+	a := newAffinityRouter(5 * time.Minute)
+	a.unbind("unknown")
+	a.mu.RLock()
+	n := len(a.bindings)
+	a.mu.RUnlock()
+	if n != 0 {
+		t.Fatalf("unbind missing key should be no-op, got len=%d", n)
+	}
+}

@@ -443,5 +443,53 @@ func TestRemember_NoOpOnEmptyKey(t *testing.T) {
 	}
 }
 
+func TestRecordAffinityFailureUnbindsAndCooldowns(t *testing.T) {
+	a1 := config.Account{ID: "a1", Enabled: true, ExpiresAt: futureExpiry()}
+	a2 := config.Account{ID: "a2", Enabled: true, ExpiresAt: futureExpiry()}
+	p := newTestPoolWithAffinity([]config.Account{a1, a2})
+	p.Remember("conv1", "a1")
+
+	p.RecordAffinityFailure("conv1", "a1")
+
+	if id, ok := p.affinity.lookup("conv1", time.Now()); ok || id != "" {
+		t.Fatalf("failure should unbind conv1, got id=%q ok=%v", id, ok)
+	}
+	cd, ok := p.cooldowns["a1"]
+	if !ok {
+		t.Fatal("a1 should be in short cooldown after failure")
+	}
+	if !cd.After(time.Now()) {
+		t.Fatalf("cooldown should be in the future, got %v", cd)
+	}
+	if time.Until(cd) > affinityShortCooldown+time.Second {
+		t.Fatalf("cooldown should not exceed short cooldown, got %v", time.Until(cd))
+	}
+}
+
+func TestRecordAffinityFailureKeepsLongerCooldown(t *testing.T) {
+	p := newTestPoolWithAffinity(nil)
+	p.cooldowns["a1"] = time.Now().Add(2 * time.Hour) // 配额等长冷却
+	p.RecordAffinityFailure("", "a1")
+	if time.Until(p.cooldowns["a1"]) < time.Hour {
+		t.Fatalf("short cooldown must not override longer cooldown, got %v remaining", time.Until(p.cooldowns["a1"]))
+	}
+}
+
+func TestSelectForConversation_UnbindsWhenBoundAccountUnavailable(t *testing.T) {
+	a1 := config.Account{ID: "a1", Enabled: true, ExpiresAt: futureExpiry()}
+	a2 := config.Account{ID: "a2", Enabled: true, ExpiresAt: futureExpiry()}
+	p := newTestPoolWithAffinity([]config.Account{a1, a2})
+	p.Remember("conv1", "a1")
+	// a1 从池中移除（模拟禁用后 Reload）
+	p.accounts = []config.Account{a2}
+	acc := p.SelectForConversation("conv1", "claude-sonnet-4", nil)
+	if acc == nil || acc.ID != "a2" {
+		t.Fatalf("should migrate to a2, got %v", acc)
+	}
+	if id, ok := p.affinity.lookup("conv1", time.Now()); ok || id != "" {
+		t.Fatalf("unavailable bound account should be unbound, got id=%q ok=%v", id, ok)
+	}
+}
+
 // helper
 func futureExpiry() int64 { return time.Now().Add(1 * time.Hour).Unix() }

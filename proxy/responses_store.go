@@ -50,6 +50,17 @@ func saveResponse(resp *ResponsesObject) error {
 		resp.StoredAt = time.Now().Unix()
 	}
 
+	// 归一链根：沿 previous_response_id 向上取链根 response 的 ID（O(1)，父已存根），
+	// 供会话亲和作为稳定会话标识。RootResponseID 对客户端不可见。
+	if resp.RootResponseID == "" {
+		resp.RootResponseID = resp.ID
+		if resp.PreviousResponseID != "" {
+			if root := resolveChainRoot(resp.PreviousResponseID); root != "" {
+				resp.RootResponseID = root
+			}
+		}
+	}
+
 	persisted := storedResponseDoc{
 		ID:                 resp.ID,
 		Object:             resp.Object,
@@ -63,6 +74,7 @@ func saveResponse(resp *ResponsesObject) error {
 		Instructions:       resp.Instructions,
 		StoredInput:        resp.StoredInput,
 		StoredAt:           resp.StoredAt,
+		RootResponseID:     resp.RootResponseID,
 	}
 
 	path := filepath.Join(dir, sanitizeResponseID(resp.ID)+".json")
@@ -111,6 +123,7 @@ func loadResponse(id string) (*ResponsesObject, error) {
 		Instructions:       doc.Instructions,
 		StoredInput:        doc.StoredInput,
 		StoredAt:           doc.StoredAt,
+		RootResponseID:     doc.RootResponseID,
 	}, nil
 }
 
@@ -179,4 +192,5 @@ type storedResponseDoc struct {
 	Instructions       string               `json:"instructions,omitempty"`
 	StoredInput        json.RawMessage      `json:"stored_input,omitempty"`
 	StoredAt           int64                `json:"stored_at"`
+	RootResponseID     string               `json:"root_response_id,omitempty"`
 }

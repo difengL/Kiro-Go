@@ -1,8 +1,12 @@
 package proxy
 
 import (
+	"kiro-go/config"
+	"net/http"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestExtractOpenAIMessageTextStructured(t *testing.T) {
@@ -659,7 +663,7 @@ func TestResolveClaudeConversationID_Deterministic(t *testing.T) {
 		},
 		MaxTokens: 100,
 	}
-	id1 := ResolveClaudeConversationID(req)
+	id1 := ResolveClaudeConversationID(nil, req)
 	if id1 == "" {
 		t.Fatal("want non-empty convID for real anchor")
 	}
@@ -676,7 +680,7 @@ func TestResolveClaudeConversationID_Deterministic(t *testing.T) {
 		},
 		MaxTokens: 100,
 	}
-	id2 := ResolveClaudeConversationID(req2)
+	id2 := ResolveClaudeConversationID(nil, req2)
 	if id1 != id2 {
 		t.Fatalf("same anchor+system+model should produce same convID: %q vs %q", id1, id2)
 	}
@@ -690,7 +694,7 @@ func TestResolveClaudeConversationID_SyntheticAnchorEmpty(t *testing.T) {
 		},
 		MaxTokens: 100,
 	}
-	if id := ResolveClaudeConversationID(req); id != "" {
+	if id := ResolveClaudeConversationID(nil, req); id != "" {
 		t.Fatalf("synthetic anchor should yield empty convID, got %q", id)
 	}
 }
@@ -701,7 +705,7 @@ func TestResolveClaudeConversationID_NoAnchorEmpty(t *testing.T) {
 		Messages: []ClaudeMessage{{Role: "assistant", Content: "hi"}},
 		MaxTokens: 100,
 	}
-	if id := ResolveClaudeConversationID(req); id != "" {
+	if id := ResolveClaudeConversationID(nil, req); id != "" {
 		t.Fatalf("no user anchor should yield empty convID, got %q", id)
 	}
 }
@@ -714,7 +718,7 @@ func TestResolveOpenAIConversationID_Deterministic(t *testing.T) {
 			{Role: "assistant", Content: "2"},
 		},
 	}
-	id1 := ResolveOpenAIConversationID(req)
+	id1 := ResolveOpenAIConversationID(nil, req)
 	if !strings.Contains(id1, "-") {
 		t.Fatalf("want uuid-like convID, got %q", id1)
 	}
@@ -728,7 +732,7 @@ func TestResolveOpenAIConversationID_Deterministic(t *testing.T) {
 			{Role: "user", Content: "And 2+2?"},
 		},
 	}
-	id2 := ResolveOpenAIConversationID(req2)
+	id2 := ResolveOpenAIConversationID(nil, req2)
 	if id1 != id2 {
 		t.Fatalf("same anchor+system+model should produce same convID: %q vs %q", id1, id2)
 	}
@@ -741,7 +745,7 @@ func TestResolveOpenAIConversationID_SyntheticAnchorEmpty(t *testing.T) {
 			{Role: "user", Content: "."},
 		},
 	}
-	if id := ResolveOpenAIConversationID(req); id != "" {
+	if id := ResolveOpenAIConversationID(nil, req); id != "" {
 		t.Fatalf("synthetic anchor should yield empty convID, got %q", id)
 	}
 }
@@ -751,7 +755,48 @@ func TestResolveOpenAIConversationID_NoAnchorEmpty(t *testing.T) {
 		Model:    "gpt-4",
 		Messages: []OpenAIMessage{{Role: "assistant", Content: "hi"}},
 	}
-	if id := ResolveOpenAIConversationID(req); id != "" {
+	if id := ResolveOpenAIConversationID(nil, req); id != "" {
+		t.Fatalf("no user anchor should yield empty convID, got %q", id)
+	}
+}
+
+func TestResolveResponsesConversationID_Deterministic(t *testing.T) {
+	// 模拟 Responses 场景：instructions 作为 system，input 含多轮消息。
+	messages := []OpenAIMessage{
+		{Role: "system", Content: "You are a helpful assistant."},
+		{Role: "user", Content: "Hello, what is 1+1?"},
+		{Role: "assistant", Content: "2"},
+	}
+	id1 := ResolveResponsesConversationID(nil, "claude-sonnet-4", messages, nil)
+	if !strings.Contains(id1, "-") {
+		t.Fatalf("want uuid-like convID, got %q", id1)
+	}
+
+	// 同一对话链（previous_response_id 展开后历史更长但首条 user 不变）应返回相同 ID
+	continued := []OpenAIMessage{
+		{Role: "system", Content: "You are a helpful assistant."},
+		{Role: "user", Content: "Hello, what is 1+1?"},
+		{Role: "assistant", Content: "2"},
+		{Role: "user", Content: "And 2+2?"},
+	}
+	id2 := ResolveResponsesConversationID(nil, "claude-sonnet-4", continued, nil)
+	if id1 != id2 {
+		t.Fatalf("same anchor+system+model should produce same convID: %q vs %q", id1, id2)
+	}
+}
+
+func TestResolveResponsesConversationID_SyntheticAnchorEmpty(t *testing.T) {
+	messages := []OpenAIMessage{
+		{Role: "user", Content: "."},
+	}
+	if id := ResolveResponsesConversationID(nil, "claude-sonnet-4", messages, nil); id != "" {
+		t.Fatalf("synthetic anchor should yield empty convID, got %q", id)
+	}
+}
+
+func TestResolveResponsesConversationID_NoAnchorEmpty(t *testing.T) {
+	messages := []OpenAIMessage{{Role: "assistant", Content: "hi"}}
+	if id := ResolveResponsesConversationID(nil, "claude-sonnet-4", messages, nil); id != "" {
 		t.Fatalf("no user anchor should yield empty convID, got %q", id)
 	}
 }
@@ -768,7 +813,7 @@ func TestResolveClaudeConversationID_SystemBlocks(t *testing.T) {
 		},
 		MaxTokens: 100,
 	}
-	id1 := ResolveClaudeConversationID(req)
+	id1 := ResolveClaudeConversationID(nil, req)
 	if id1 == "" {
 		t.Fatal("want non-empty convID for real anchor with system blocks")
 	}
@@ -787,9 +832,138 @@ func TestResolveClaudeConversationID_SystemBlocks(t *testing.T) {
 		},
 		MaxTokens: 100,
 	}
-	id2 := ResolveClaudeConversationID(req2)
+	id2 := ResolveClaudeConversationID(nil, req2)
 	if id1 != id2 {
 		t.Fatalf("same anchor+system blocks+model should produce same convID: %q vs %q", id1, id2)
+	}
+}
+
+func TestResolveConversationID_ExplicitQueryOverridesAnchor(t *testing.T) {
+	r, _ := http.NewRequest("POST", "/v1/messages?conversation_id=my-session-42", nil)
+	req := &ClaudeRequest{
+		Model:    "claude-sonnet-4",
+		Messages: []ClaudeMessage{{Role: "user", Content: "hi"}},
+	}
+	id1 := ResolveClaudeConversationID(r, req)
+	if !strings.HasPrefix(id1, "sess_") {
+		t.Fatalf("explicit query should produce sess_ prefix, got %q", id1)
+	}
+	// 同一显式 ID 下内容/模型不同也应稳定
+	id2 := ResolveClaudeConversationID(r, &ClaudeRequest{
+		Model:    "claude-opus-4",
+		Messages: []ClaudeMessage{{Role: "user", Content: "different first msg"}},
+	})
+	if id1 != id2 {
+		t.Fatalf("explicit session ID should be stable across content, got %q vs %q", id1, id2)
+	}
+}
+
+func TestResolveConversationID_ExplicitHeader(t *testing.T) {
+	r, _ := http.NewRequest("POST", "/v1/chat/completions", nil)
+	r.Header.Set("X-Kiro-Conversation-Id", "sess-header-1")
+	req := &OpenAIRequest{
+		Model:    "gpt-4",
+		Messages: []OpenAIMessage{{Role: "user", Content: "hi"}},
+	}
+	id := ResolveOpenAIConversationID(r, req)
+	if !strings.HasPrefix(id, "sess_") {
+		t.Fatalf("explicit header should produce sess_ prefix, got %q", id)
+	}
+}
+
+func TestResolveConversationID_ContentAnchorPrefix(t *testing.T) {
+	req := &OpenAIRequest{
+		Model:    "gpt-4",
+		Messages: []OpenAIMessage{{Role: "user", Content: "hello"}},
+	}
+	id := ResolveOpenAIConversationID(nil, req)
+	if !strings.HasPrefix(id, "anch_") {
+		t.Fatalf("content anchor should produce anch_ prefix, got %q", id)
+	}
+}
+
+func TestResolveResponsesConversationID_MetadataOverridesChain(t *testing.T) {
+	req := &ResponsesRequest{
+		Model:    "claude-sonnet-4.5",
+		Metadata: map[string]string{"conversation_id": "meta-session-9"},
+	}
+	id := ResolveResponsesConversationID(nil, "claude-sonnet-4.5", nil, req)
+	if !strings.HasPrefix(id, "sess_") {
+		t.Fatalf("metadata conversation_id should produce sess_ prefix, got %q", id)
+	}
+}
+
+func TestResolveResponsesConversationID_ChainRoot(t *testing.T) {
+	cfgFile := filepath.Join(t.TempDir(), "config.json")
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+
+	// 根 response
+	root := &ResponsesObject{ID: "resp_root", Object: "response", CreatedAt: time.Now().Unix(), Status: "completed", Model: "claude-sonnet-4.5"}
+	if err := saveResponse(root); err != nil {
+		t.Fatalf("save root: %v", err)
+	}
+	// 中间 response，previous 指向 root；saveResponse 应归一 RootResponseID=resp_root
+	mid := &ResponsesObject{ID: "resp_mid", Object: "response", CreatedAt: time.Now().Unix(), Status: "completed", Model: "claude-sonnet-4.5", PreviousResponseID: "resp_root"}
+	if err := saveResponse(mid); err != nil {
+		t.Fatalf("save mid: %v", err)
+	}
+
+	// 新请求 previous_response_id=resp_mid → 链根应为 resp_root
+	req := &ResponsesRequest{Model: "claude-sonnet-4.5", PreviousResponseID: "resp_mid"}
+	id := ResolveResponsesConversationID(nil, "claude-sonnet-4.5", nil, req)
+	want := buildRootConversationID("resp_root")
+	if id != want {
+		t.Fatalf("chain root expected %q, got %q", want, id)
+	}
+}
+
+func TestResolveClaudeConversationID_ClaudeCodeSessionHeader(t *testing.T) {
+	r, _ := http.NewRequest("POST", "/v1/messages", nil)
+	r.Header.Set("x-claude-code-session-id", "uuid-session-abc-123")
+	req := &ClaudeRequest{
+		Model:    "claude-sonnet-4",
+		System:   "You are helpful",
+		Messages: []ClaudeMessage{{Role: "user", Content: "hi"}},
+	}
+	id1 := ResolveClaudeConversationID(r, req)
+	if !strings.HasPrefix(id1, "sess_") {
+		t.Fatalf("claude-code session id should produce sess_ prefix, got %q", id1)
+	}
+	// 会话内不同轮次（system 动态变化、消息不同）也应以 session id 稳定
+	id2 := ResolveClaudeConversationID(r, &ClaudeRequest{
+		Model:    "claude-sonnet-4",
+		System:   "You are helpful\n(cwd: /tmp) dynamic",
+		Messages: []ClaudeMessage{{Role: "user", Content: "another turn"}},
+	})
+	if id1 != id2 {
+		t.Fatalf("x-claude-code-session-id should be stable across turns, got %q vs %q", id1, id2)
+	}
+}
+
+func TestResolveClaudeConversationID_SystemAnchorUsesFirstBlockOnly(t *testing.T) {
+	// 模拟 Claude Code：首块 attribution 稳定，后续块含动态内容（cwd/git/日期/提醒）
+	base := &ClaudeRequest{
+		Model: "claude-sonnet-4",
+		System: []interface{}{
+			map[string]interface{}{"type": "text", "text": "stable attribution block"},
+			map[string]interface{}{"type": "text", "text": "cwd: /repo, git: main, date: 2026-08-11"},
+		},
+		Messages: []ClaudeMessage{{Role: "user", Content: "build a calculator"}},
+	}
+	turn2 := &ClaudeRequest{
+		Model: "claude-sonnet-4",
+		System: []interface{}{
+			map[string]interface{}{"type": "text", "text": "stable attribution block"},
+			map[string]interface{}{"type": "text", "text": "cwd: /repo, git: main, date: 2026-08-11, reminder: check tests"},
+		},
+		Messages: []ClaudeMessage{{Role: "user", Content: "build a calculator"}},
+	}
+	id1 := ResolveClaudeConversationID(nil, base)
+	id2 := ResolveClaudeConversationID(nil, turn2)
+	if id1 == "" || id1 != id2 {
+		t.Fatalf("anchor should be stable when only trailing dynamic system blocks change: %q vs %q", id1, id2)
 	}
 }
 

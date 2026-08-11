@@ -31,6 +31,7 @@ type ResponsesObject struct {
 	StoredInput        json.RawMessage      `json:"-"`
 	StoredInstr        string               `json:"-"`
 	StoredAt           int64                `json:"stored_at,omitempty"`
+	RootResponseID     string               `json:"-"` // 链根 response ID，供会话亲和，不对客户端输出
 }
 
 type ResponseOutputItem struct {

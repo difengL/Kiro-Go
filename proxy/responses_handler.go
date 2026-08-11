@@ -113,19 +113,23 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	respID := generateResponseID()
 
+	// 会话亲和：三级解析 convID——显式会话 ID（header/query/metadata conversation_id）
+	// > previous_response_id 链根 > 内容锚点（基于组装后的完整消息列表）。
+	convID := ResolveResponsesConversationID(r, actualModel, finalMessages, &req)
+
 	if req.Stream {
 		h.handleResponsesStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens,
-			apiKeyID, respID, &req, storedInputCopy, storeResponse)
+			apiKeyID, convID, respID, &req, storedInputCopy, storeResponse)
 		return
 	}
 
 	h.handleResponsesNonStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens,
-		apiKeyID, respID, &req, storedInputCopy, storeResponse)
+		apiKeyID, convID, respID, &req, storedInputCopy, storeResponse)
 }
 
 func (h *Handler) handleResponsesNonStream(
 	w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
-	estimatedInputTokens int, apiKeyID, respID string,
+	estimatedInputTokens int, apiKeyID, convID, respID string,
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
 ) {
 	excluded := make(map[string]bool)
@@ -133,14 +137,14 @@ func (h *Handler) handleResponsesNonStream(
 	reqStart := time.Now()
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
+		account := h.pool.SelectForConversation(convID, model, excluded)
 		if account == nil {
 			break
 		}
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			h.failAccount(convID, account, err)
 			continue
 		}
 
@@ -170,7 +174,7 @@ func (h *Handler) handleResponsesNonStream(
 		if err != nil {
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			h.failAccount(convID, account, err)
 			continue
 		}
 
@@ -188,6 +192,7 @@ func (h *Handler) handleResponsesNonStream(
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
+		h.pool.Remember(convID, account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.recordSuccessLog("responses", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
@@ -273,7 +278,7 @@ func buildResponsesObject(
 
 func (h *Handler) handleResponsesStream(
 	w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
-	estimatedInputTokens int, apiKeyID, respID string,
+	estimatedInputTokens int, apiKeyID, convID, respID string,
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
 ) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
@@ -318,14 +323,14 @@ func (h *Handler) handleResponsesStream(
 	reqStart := time.Now()
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
+		account := h.pool.SelectForConversation(convID, model, excluded)
 		if account == nil {
 			break
 		}
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			h.failAccount(convID, account, err)
 			continue
 		}
 
@@ -475,7 +480,7 @@ func (h *Handler) handleResponsesStream(
 			if !responseStarted {
 				lastErr = err
 				excluded[account.ID] = true
-				h.handleAccountFailure(account, err)
+				h.failAccount(convID, account, err)
 				continue
 			}
 			send("response.failed", map[string]interface{}{
@@ -535,6 +540,7 @@ func (h *Handler) handleResponsesStream(
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
+		h.pool.Remember(convID, account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.recordSuccessLog("responses", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 

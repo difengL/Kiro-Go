@@ -105,6 +105,29 @@ func TestResponsesStoreAndLoad(t *testing.T) {
 	}
 }
 
+func TestRememberResponsesAccountBridgesContentAndRootKeys(t *testing.T) {
+	h, cleanup := setupResponsesTestHandler(t)
+	defer cleanup()
+
+	resp := &ResponsesObject{ID: "resp_affinity_bridge_test"}
+	contentKey := "anch_responses_bridge_test"
+	h.rememberResponsesAccount(contentKey, resp, "test-account")
+
+	if resp.RootResponseID != resp.ID {
+		t.Fatalf("expected first response to be its own chain root, got %q", resp.RootResponseID)
+	}
+
+	for _, key := range []string{contentKey, buildRootConversationID(resp.ID)} {
+		got := h.pool.SelectForConversation(key, "claude-sonnet-4.5", nil)
+		if got == nil {
+			t.Fatalf("expected account for affinity key %q", key)
+		}
+		if got.ID != "test-account" {
+			t.Fatalf("affinity key %q routed to %q, want test-account", key, got.ID)
+		}
+	}
+}
+
 func TestResponsesPreviousResponseIDExpands(t *testing.T) {
 	prev := &ResponsesObject{
 		ID:          "resp_prev",

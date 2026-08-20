@@ -837,6 +837,42 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	// Stream or non-stream
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	convID := ResolveClaudeConversationID(r, &req)
+
+	// TEMP DEBUG
+	{
+		lastRole, lastType := "", ""
+		if len(req.Messages) > 0 {
+			lm := req.Messages[len(req.Messages)-1]
+			lastRole = lm.Role
+			switch v := lm.Content.(type) {
+			case string:
+				lastType = "string"
+			case []interface{}:
+				ts := make([]string, 0, len(v))
+				for _, b := range v {
+					if bm, ok := b.(map[string]interface{}); ok {
+						if t, _ := bm["type"].(string); t != "" {
+							ts = append(ts, t)
+						}
+					}
+				}
+				lastType = strings.Join(ts, ",")
+			}
+		}
+		hasReminder := false
+		for i := len(req.Messages) - 1; i >= 0 && i >= len(req.Messages)-3; i-- {
+			if req.Messages[i].Role == "system" {
+				hasReminder = true
+				break
+			}
+		}
+		cid := convID
+		if len(cid) > 12 {
+			cid = cid[:12]
+		}
+		dbgLog("REQ conv=%s tools=%d msgs=%d lastRole=%s lastType=%s reminderAtEnd=%v", cid, len(req.Tools), len(req.Messages), lastRole, lastType, hasReminder)
+	}
+
 	if req.Stream {
 		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, convID)
 	} else {
@@ -1212,7 +1248,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 				credits = c
 			},
 			OnContextUsage: func(pct float64) {
-				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+				realInputTokens = int(pct * float64(h.effectiveContextWindow(model)) / 100.0)
 			},
 		}
 
@@ -1487,7 +1523,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 				credits = c
 			},
 			OnContextUsage: func(pct float64) {
-				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+				realInputTokens = int(pct * float64(h.effectiveContextWindow(model)) / 100.0)
 			},
 		}
 
@@ -1542,7 +1578,8 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		}
 
 		resp := KiroToClaudeResponse(finalContent, responseThinkingContent, includeEmptyThinkingBlock, toolUses, inputTokens, outputTokens, model)
-		resp.Usage.InputTokens = billedClaudeInputTokens(inputTokens, cacheUsage)
+		// 官方语义：input_tokens 报全量输入（含缓存命中），缓存单列。
+		resp.Usage.InputTokens = inputTokens
 		resp.Usage.CacheCreationInputTokens = cacheUsage.CacheCreationInputTokens
 		resp.Usage.CacheReadInputTokens = cacheUsage.CacheReadInputTokens
 		if cacheProfile != nil {
@@ -1577,6 +1614,27 @@ func (h *Handler) sendClaudeError(w http.ResponseWriter, status int, errType, me
 	})
 }
 
+// effectiveContextWindow 优先使用 ListAvailableModels 返回的真实上下文窗口
+// （h.cachedModels 里的 TokenLimits.MaxInputTokens），让 contextUsagePercentage
+// 换算出的输入 token 更贴近真实；找不到匹配时回退到静态硬编码
+// getContextWindowSize。
+func (h *Handler) effectiveContextWindow(model string) int {
+	if h != nil && model != "" {
+		h.modelsCacheMu.RLock()
+		cached := h.cachedModels
+		h.modelsCacheMu.RUnlock()
+		for _, m := range cached {
+			if m.TokenLimits == nil || m.TokenLimits.MaxInputTokens <= 0 {
+				continue
+			}
+			if strings.EqualFold(m.ModelId, model) {
+				return m.TokenLimits.MaxInputTokens
+			}
+		}
+	}
+	return getContextWindowSize(model)
+}
+
 // handleOpenAIChat OpenAI API 处理
 func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
@@ -1604,21 +1662,25 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
 	req.Model = actualModel
-	estimatedInputTokens := estimateOpenAIRequestInputTokens(&req)
+	// 单次 BPE 编码同时产出总 token 与逐消息 token，供缓存 profile 复用。
+	estimatedInputTokens, perMsgTokens := estimateOpenAIRequestInputTokensDetailed(&req)
+
+	// GPT 缓存命中模拟：自动前缀缓存模型，两种协议统一走 OpenAIRequest。
+	gptProfile := h.promptCache.BuildOpenAIProfile(&req, estimatedInputTokens, perMsgTokens)
 
 	kiroPayload := OpenAIToKiro(&req, thinking)
 	convID := ResolveOpenAIConversationID(r, &req)
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	if req.Stream {
-		h.handleOpenAIStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID, convID)
+		h.handleOpenAIStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, gptProfile, apiKeyID, convID)
 	} else {
-		h.handleOpenAINonStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID, convID)
+		h.handleOpenAINonStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, gptProfile, apiKeyID, convID)
 	}
 }
 
 // handleOpenAIStream OpenAI 流式响应
-func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string, convID string) {
+func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, gptProfile *promptCacheProfile, apiKeyID string, convID string) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -1649,11 +1711,14 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			continue
 		}
 
+		gptUsage := h.promptCache.Compute(account.ID, gptProfile)
+
 		var toolCalls []ToolCall
 		var toolCallIndex int
 		var inputTokens, outputTokens int
 		var credits float64
 		var realInputTokens int
+		var upstreamUsage KiroTokenUsage
 		var rawContentBuilder strings.Builder
 		var rawReasoningBuilder strings.Builder
 		var textBuffer string
@@ -1926,8 +1991,9 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 				credits = c
 			},
 			OnContextUsage: func(pct float64) {
-				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+				realInputTokens = int(pct * float64(h.effectiveContextWindow(model)) / 100.0)
 			},
+			OnTokenUsage: func(usage KiroTokenUsage) { upstreamUsage = usage },
 		}
 
 		err := CallKiroAPI(account, payload, callback)
@@ -1960,16 +2026,22 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		if !thinking {
 			reasoningOutput = ""
 		}
-		outputTokens = estimateApproxTokens(outputContent) + estimateApproxTokens(reasoningOutput)
+		outputTokens = bpeTokenCountGPT(outputContent) + bpeTokenCountGPT(reasoningOutput)
 		for _, tc := range toolCalls {
-			outputTokens += estimateApproxTokens(tc.Function.Name)
-			outputTokens += estimateApproxTokens(tc.Function.Arguments)
+			outputTokens += bpeTokenCountGPT(tc.Function.Name)
+			outputTokens += bpeTokenCountGPT(tc.Function.Arguments)
 		}
+
+		logger.Infof("[OpenAI] complete model=%s account=%s input=%d output=%d upstream_input=%d uncached=%d cache_read=%d cache_write=%d cache_creation=%d cache_fields_present=%t",
+			model, account.ID, inputTokens, outputTokens, upstreamUsage.InputTokens,
+			upstreamUsage.UncachedInputTokens, upstreamUsage.CacheReadInputTokens, upstreamUsage.CacheWriteInputTokens,
+			upstreamUsage.CacheCreationInputTokens, upstreamUsage.CacheFieldsPresent)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.recordSuccessLog("openai", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.promptCache.Update(account.ID, gptProfile)
 			h.pool.Remember(convID, account.ID)
 
 		finishReason := "stop"
@@ -1987,11 +2059,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 				"delta":         map[string]interface{}{},
 				"finish_reason": finishReason,
 			}},
-			"usage": map[string]int{
-				"prompt_tokens":     inputTokens,
-				"completion_tokens": outputTokens,
-				"total_tokens":      inputTokens + outputTokens,
-			},
+			"usage": buildOpenAIUsageMap(inputTokens, outputTokens, gptUsage.CacheReadInputTokens),
 		}
 		data, _ := json.Marshal(chunk)
 		fmt.Fprintf(w, "data: %s\n\n", string(data))
@@ -2010,7 +2078,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 }
 
 // handleOpenAINonStream OpenAI 非流式响应
-func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string, convID string) {
+func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, gptProfile *promptCacheProfile, apiKeyID string, convID string) {
 	excluded := make(map[string]bool)
 	var lastErr error
 	reqStart := time.Now()
@@ -2027,12 +2095,15 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			continue
 		}
 
+		gptUsage := h.promptCache.Compute(account.ID, gptProfile)
+
 		var content string
 		var reasoningContent string
 		var toolUses []KiroToolUse
 		var inputTokens, outputTokens int
 		var credits float64
 		var realInputTokens int
+		var upstreamUsage KiroTokenUsage
 
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
@@ -2046,8 +2117,9 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			OnComplete: func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
 			OnCredits:  func(c float64) { credits = c },
 			OnContextUsage: func(pct float64) {
-				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+				realInputTokens = int(pct * float64(h.effectiveContextWindow(model)) / 100.0)
 			},
+			OnTokenUsage: func(usage KiroTokenUsage) { upstreamUsage = usage },
 		}
 
 		err := CallKiroAPI(account, payload, callback)
@@ -2072,14 +2144,20 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		}
 		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
 
+		logger.Infof("[OpenAI] complete model=%s account=%s input=%d output=%d upstream_input=%d uncached=%d cache_read=%d cache_write=%d cache_creation=%d cache_fields_present=%t",
+			model, account.ID, inputTokens, outputTokens, upstreamUsage.InputTokens,
+			upstreamUsage.UncachedInputTokens, upstreamUsage.CacheReadInputTokens, upstreamUsage.CacheWriteInputTokens,
+			upstreamUsage.CacheCreationInputTokens, upstreamUsage.CacheFieldsPresent)
+
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.recordSuccessLog("openai", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.promptCache.Update(account.ID, gptProfile)
 			h.pool.Remember(convID, account.ID)
 
 		thinkingFormat := config.GetThinkingConfig().OpenAIFormat
-		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, model, thinkingFormat)
+		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, model, thinkingFormat, gptUsage.CacheReadInputTokens)
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		json.NewEncoder(w).Encode(resp)
 		return

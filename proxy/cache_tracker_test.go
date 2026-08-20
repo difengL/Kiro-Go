@@ -56,8 +56,9 @@ func TestBuildClaudeUsageMapIncludesCacheFields(t *testing.T) {
 
 	m := buildClaudeUsageMap(100, 50, usage, true)
 
-	if got := m["input_tokens"]; got != 50 {
-		t.Fatalf("expected billed input tokens 50, got %#v", got)
+	// 官方语义：input_tokens 报全量输入（含缓存命中），缓存单列。
+	if got := m["input_tokens"]; got != 100 {
+		t.Fatalf("expected full input tokens 100, got %#v", got)
 	}
 	if got := m["cache_creation_input_tokens"]; got != 30 {
 		t.Fatalf("expected cache creation tokens 30, got %#v", got)
@@ -260,5 +261,77 @@ func TestPromptCacheImplicitBreakpointAtMessageEnd(t *testing.T) {
 	result := tracker.Compute("acct-1", profile2)
 	if result.CacheReadInputTokens == 0 {
 		t.Fatalf("expected cache read via implicit message-end breakpoint, got %+v", result)
+	}
+}
+
+func TestBuildOpenAIProfilePrefixStable(t *testing.T) {
+	tracker := newPromptCacheTracker(time.Hour)
+	longSystem := strings.Repeat("You are a helpful coding assistant with deep knowledge of Go, Rust, Python, and TypeScript. ", 100)
+
+	req1 := &OpenAIRequest{
+		Model: "gpt-5.6-luna",
+		Messages: []OpenAIMessage{
+			{Role: "system", Content: longSystem},
+			{Role: "user", Content: "first question"},
+			{Role: "assistant", Content: "first answer"},
+		},
+	}
+	profile1 := tracker.BuildOpenAIProfile(req1, 0, nil)
+	if profile1 == nil || len(profile1.Breakpoints) != 3 {
+		t.Fatalf("expected 3 breakpoints, got %+v", profile1)
+	}
+
+	// 相同请求 → 指纹完全一致
+	req1b := &OpenAIRequest{Model: "gpt-5.6-luna", Messages: req1.Messages}
+	profile1b := tracker.BuildOpenAIProfile(req1b, 0, nil)
+	for i := range profile1.Breakpoints {
+		if profile1.Breakpoints[i].Fingerprint != profile1b.Breakpoints[i].Fingerprint {
+			t.Fatalf("fingerprint drift at breakpoint %d", i)
+		}
+	}
+
+	// 追加一条消息 → 前 N 个断点指纹不变（前缀稳定），新增第 4 个断点
+	req2 := &OpenAIRequest{
+		Model: "gpt-5.6-luna",
+		Messages: append(append([]OpenAIMessage{}, req1.Messages...), OpenAIMessage{
+			Role: "user", Content: "follow-up question",
+		}),
+	}
+	profile2 := tracker.BuildOpenAIProfile(req2, 0, nil)
+	if len(profile2.Breakpoints) != 4 {
+		t.Fatalf("expected 4 breakpoints, got %d", len(profile2.Breakpoints))
+	}
+	for i := range profile1.Breakpoints {
+		if profile1.Breakpoints[i].Fingerprint != profile2.Breakpoints[i].Fingerprint {
+			t.Fatalf("prefix fingerprint changed at breakpoint %d", i)
+		}
+	}
+}
+
+func TestPromptCacheTrackerGPTComputeAndUpdate(t *testing.T) {
+	tracker := newPromptCacheTracker(time.Hour)
+	longSystem := strings.Repeat("You are a helpful coding assistant with deep knowledge of Go, Rust, Python, and TypeScript. ", 200)
+	req := &OpenAIRequest{
+		Model: "gpt-5.6-luna",
+		Messages: []OpenAIMessage{
+			{Role: "system", Content: longSystem},
+			{Role: "user", Content: "hello world"},
+		},
+	}
+
+	profile := tracker.BuildOpenAIProfile(req, 0, nil)
+	if profile == nil {
+		t.Fatalf("expected GPT cache profile to be built")
+	}
+
+	first := tracker.Compute("gpt-acct", profile)
+	if first.CacheReadInputTokens != 0 {
+		t.Fatalf("expected first request to have zero cache reads, got %+v", first)
+	}
+
+	tracker.Update("gpt-acct", profile)
+	second := tracker.Compute("gpt-acct", profile)
+	if second.CacheReadInputTokens <= 0 {
+		t.Fatalf("expected repeated request to read cached tokens, got %+v", second)
 	}
 }

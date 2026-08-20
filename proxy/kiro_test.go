@@ -45,6 +45,33 @@ func TestNormalizeChunkOverlapDelta(t *testing.T) {
 	}
 }
 
+func TestUpdateTokenUsageFromEventDetectsZeroCacheFields(t *testing.T) {
+	var usage KiroTokenUsage
+	updateTokenUsageFromEvent(map[string]interface{}{
+		"usage": map[string]interface{}{
+			"inputTokens":              float64(120),
+			"outputTokens":             float64(8),
+			"uncachedInputTokens":      float64(120),
+			"cacheReadInputTokens":     float64(0),
+			"cacheWriteInputTokens":    float64(0),
+			"cacheCreationInputTokens": float64(0),
+		},
+	}, &usage)
+
+	if usage.InputTokens != 120 || usage.OutputTokens != 8 {
+		t.Fatalf("unexpected token usage: %#v", usage)
+	}
+	if usage.UncachedInputTokens != 120 {
+		t.Fatalf("expected uncached input tokens to be preserved, got %d", usage.UncachedInputTokens)
+	}
+	if usage.CacheReadInputTokens != 0 || usage.CacheWriteInputTokens != 0 || usage.CacheCreationInputTokens != 0 {
+		t.Fatalf("expected zero cache counters, got %#v", usage)
+	}
+	if !usage.CacheFieldsPresent {
+		t.Fatal("expected zero-valued cache fields to be reported as present")
+	}
+}
+
 func TestParseEventStreamFinishesPendingToolUseOnEOF(t *testing.T) {
 	stream := bytes.NewReader(awsEventStreamFrame(t, "toolUseEvent", map[string]interface{}{
 		"toolUseId": "toolu_1",

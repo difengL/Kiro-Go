@@ -1106,9 +1106,16 @@ type OpenAIChoice struct {
 }
 
 type OpenAIUsage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	PromptTokens         int                    `json:"prompt_tokens"`
+	CompletionTokens     int                    `json:"completion_tokens"`
+	TotalTokens          int                    `json:"total_tokens"`
+	PromptTokensDetails  *OpenAIPromptTokenDetails `json:"prompt_tokens_details,omitempty"`
+}
+
+// OpenAIPromptTokenDetails carries the simulated prompt-cache hit count under
+// the official OpenAI field name prompt_tokens_details.cached_tokens.
+type OpenAIPromptTokenDetails struct {
+	CachedTokens int `json:"cached_tokens"`
 }
 
 // ==================== OpenAI -> Kiro 转换 ====================
@@ -1961,20 +1968,33 @@ func ResolveOpenAIConversationID(r *http.Request, req *OpenAIRequest) string {
 // 优先级：显式会话 ID（header/query > metadata conversation_id）>
 // previous_response_id 链根 > 内容锚点。Returns "" for synthetic/absent anchors.
 func ResolveResponsesConversationID(r *http.Request, model string, messages []OpenAIMessage, req *ResponsesRequest) string {
+	id, _ := ResolveResponsesConversationIDWithSource(r, model, messages, req)
+	return id
+}
+
+// ResolveResponsesConversationIDWithSource is the diagnostic form of
+// ResolveResponsesConversationID. The source is intentionally coarse and
+// never includes prompt content: explicit_request_id, metadata_conversation_id,
+// previous_response_root, content_anchor, or empty.
+func ResolveResponsesConversationIDWithSource(r *http.Request, model string, messages []OpenAIMessage, req *ResponsesRequest) (string, string) {
 	if cid := explicitConversationIDFromRequest(r); cid != "" {
-		return buildExplicitConversationID(cid)
+		return buildExplicitConversationID(cid), "explicit_request_id"
 	}
 	if req != nil {
-		if cid := req.Metadata["conversation_id"]; cid != "" {
-			return buildExplicitConversationID(cid)
+		if cid := strings.TrimSpace(req.Metadata["conversation_id"]); cid != "" {
+			return buildExplicitConversationID(cid), "metadata_conversation_id"
 		}
 		if req.PreviousResponseID != "" {
 			if root := resolveChainRoot(req.PreviousResponseID); root != "" {
-				return buildRootConversationID(root)
+				return buildRootConversationID(root), "previous_response_root"
 			}
 		}
 	}
-	return resolveConversationID(model, messages)
+	id := resolveConversationID(model, messages)
+	if id == "" {
+		return "", "empty"
+	}
+	return id, "content_anchor"
 }
 
 func isSyntheticConversationAnchor(anchor string) bool {
@@ -2244,7 +2264,7 @@ func extractThinkingFromContent(content string) (string, string) {
 }
 
 // KiroToOpenAIResponseWithReasoning 带 reasoning_content 的 OpenAI 响应
-func KiroToOpenAIResponseWithReasoning(content, reasoningContent string, toolUses []KiroToolUse, inputTokens, outputTokens int, model, thinkingFormat string) map[string]interface{} {
+func KiroToOpenAIResponseWithReasoning(content, reasoningContent string, toolUses []KiroToolUse, inputTokens, outputTokens int, model, thinkingFormat string, cachedTokens int) map[string]interface{} {
 	finishReason := "stop"
 
 	message := map[string]interface{}{
@@ -2294,10 +2314,21 @@ func KiroToOpenAIResponseWithReasoning(content, reasoningContent string, toolUse
 			"message":       message,
 			"finish_reason": finishReason,
 		}},
-		"usage": map[string]int{
-			"prompt_tokens":     inputTokens,
-			"completion_tokens": outputTokens,
-			"total_tokens":      inputTokens + outputTokens,
-		},
+		"usage": buildOpenAIUsageMap(inputTokens, outputTokens, cachedTokens),
 	}
+}
+
+// buildOpenAIUsageMap emits usage in the official OpenAI shape: prompt_tokens
+// is the FULL input count (including cache hits) and the hit portion is
+// reported separately under prompt_tokens_details.cached_tokens.
+func buildOpenAIUsageMap(inputTokens, outputTokens, cachedTokens int) map[string]interface{} {
+	usage := map[string]interface{}{
+		"prompt_tokens":     inputTokens,
+		"completion_tokens": outputTokens,
+		"total_tokens":      inputTokens + outputTokens,
+	}
+	if cachedTokens > 0 {
+		usage["prompt_tokens_details"] = map[string]int{"cached_tokens": cachedTokens}
+	}
+	return usage
 }

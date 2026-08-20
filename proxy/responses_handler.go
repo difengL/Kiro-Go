@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"kiro-go/config"
+	"kiro-go/logger"
 	"net/http"
 	"strings"
 	"time"
@@ -107,7 +108,8 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
 	openaiReq.Model = actualModel
 
-	estimatedInputTokens := estimateOpenAIRequestInputTokens(openaiReq)
+	// 单次 BPE 编码同时产出总 token 与逐消息 token，供缓存 profile 复用。
+	estimatedInputTokens, perMsgTokens := estimateOpenAIRequestInputTokensDetailed(openaiReq)
 	kiroPayload := OpenAIToKiro(openaiReq, thinking)
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
@@ -115,21 +117,44 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 
 	// 会话亲和：三级解析 convID——显式会话 ID（header/query/metadata conversation_id）
 	// > previous_response_id 链根 > 内容锚点（基于组装后的完整消息列表）。
-	convID := ResolveResponsesConversationID(r, actualModel, finalMessages, &req)
+	convID, convSource := ResolveResponsesConversationIDWithSource(r, actualModel, finalMessages, &req)
+	logger.Infof("[Responses] request model=%s stream=%t source=%s conv=%s previous_response_id_present=%t messages=%d",
+		actualModel, req.Stream, convSource, responsesConversationLogID(convID), req.PreviousResponseID != "", len(finalMessages))
+
+	// GPT 缓存命中模拟：与 Chat 路径共用同一个 OpenAIRequest 构建器。
+	gptProfile := h.promptCache.BuildOpenAIProfile(openaiReq, estimatedInputTokens, perMsgTokens)
 
 	if req.Stream {
-		h.handleResponsesStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens,
-			apiKeyID, convID, respID, &req, storedInputCopy, storeResponse)
+		h.handleResponsesStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens, gptProfile,
+			apiKeyID, convID, convSource, respID, &req, storedInputCopy, storeResponse)
 		return
 	}
 
-	h.handleResponsesNonStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens,
-		apiKeyID, convID, respID, &req, storedInputCopy, storeResponse)
+	h.handleResponsesNonStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens, gptProfile,
+		apiKeyID, convID, convSource, respID, &req, storedInputCopy, storeResponse)
+}
+
+func responsesConversationLogID(id string) string {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return "<empty>"
+	}
+	if len(id) > 32 {
+		return id[:32] + "..."
+	}
+	return id
+}
+
+func responsesAccountLogID(account *config.Account) string {
+	if account == nil {
+		return "<nil>"
+	}
+	return account.ID
 }
 
 func (h *Handler) handleResponsesNonStream(
 	w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
-	estimatedInputTokens int, apiKeyID, convID, respID string,
+	estimatedInputTokens int, gptProfile *promptCacheProfile, apiKeyID, convID, convSource, respID string,
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
 ) {
 	excluded := make(map[string]bool)
@@ -137,7 +162,9 @@ func (h *Handler) handleResponsesNonStream(
 	reqStart := time.Now()
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.SelectForConversation(convID, model, excluded)
+		account, affinityReason := h.pool.SelectForConversationWithReason(convID, model, excluded)
+		logger.Infof("[Responses] route model=%s source=%s conv=%s reason=%s account=%s attempt=%d",
+			model, convSource, responsesConversationLogID(convID), affinityReason, responsesAccountLogID(account), attempt+1)
 		if account == nil {
 			break
 		}
@@ -148,11 +175,14 @@ func (h *Handler) handleResponsesNonStream(
 			continue
 		}
 
+		gptUsage := h.promptCache.Compute(account.ID, gptProfile)
+
 		var content, reasoningContent string
 		var toolUses []KiroToolUse
 		var inputTokens, outputTokens int
 		var credits float64
 		var realInputTokens int
+		var upstreamUsage KiroTokenUsage
 
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
@@ -166,8 +196,9 @@ func (h *Handler) handleResponsesNonStream(
 			OnComplete: func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
 			OnCredits:  func(c float64) { credits = c },
 			OnContextUsage: func(pct float64) {
-				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+				realInputTokens = int(pct * float64(h.effectiveContextWindow(model)) / 100.0)
 			},
+			OnTokenUsage: func(usage KiroTokenUsage) { upstreamUsage = usage },
 		}
 
 		err := CallKiroAPI(account, payload, callback)
@@ -189,16 +220,21 @@ func (h *Handler) handleResponsesNonStream(
 			inputTokens = estimatedInputTokens
 		}
 		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
+		logger.Infof("[Responses] complete model=%s conv=%s account=%s input=%d output=%d upstream_input=%d uncached=%d cache_read=%d cache_write=%d cache_creation=%d cache_fields_present=%t",
+			model, responsesConversationLogID(convID), account.ID, inputTokens, outputTokens, upstreamUsage.InputTokens,
+			upstreamUsage.UncachedInputTokens, upstreamUsage.CacheReadInputTokens, upstreamUsage.CacheWriteInputTokens,
+			upstreamUsage.CacheCreationInputTokens, upstreamUsage.CacheFieldsPresent)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
-		h.pool.Remember(convID, account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.recordSuccessLog("responses", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.promptCache.Update(account.ID, gptProfile)
 
-		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req)
+		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req, gptUsage.CacheReadInputTokens)
 		respObj.StoredInput = storedInput
 		respObj.Instructions = req.Instructions
+		h.rememberResponsesAccount(convID, respObj, account.ID)
 
 		if storeResponse {
 			if saveErr := saveResponse(respObj); saveErr != nil {
@@ -219,9 +255,35 @@ func (h *Handler) handleResponsesNonStream(
 	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
 }
 
+// rememberResponsesAccount binds both the key used for this request and the
+// stable Responses chain-root key. The first turn normally has only a content
+// anchor; subsequent turns with previous_response_id use root_<id>, so both
+// keys must point at the account selected for the first successful turn.
+func (h *Handler) rememberResponsesAccount(convID string, resp *ResponsesObject, accountID string) {
+	if resp == nil {
+		return
+	}
+
+	rootID := resp.RootResponseID
+	if rootID == "" {
+		rootID = resp.ID
+		if resp.PreviousResponseID != "" {
+			if root := resolveChainRoot(resp.PreviousResponseID); root != "" {
+				rootID = root
+			}
+		}
+		resp.RootResponseID = rootID
+	}
+
+	h.pool.Remember(convID, accountID)
+	if rootID != "" {
+		h.pool.Remember(buildRootConversationID(rootID), accountID)
+	}
+}
+
 func buildResponsesObject(
 	id, model, content string, toolUses []KiroToolUse,
-	inputTokens, outputTokens int, req *ResponsesRequest,
+	inputTokens, outputTokens int, req *ResponsesRequest, cachedTokens int,
 ) *ResponsesObject {
 	output := make([]ResponseOutputItem, 0, 1+len(toolUses))
 
@@ -263,22 +325,32 @@ func buildResponsesObject(
 		})
 	}
 
-	return &ResponsesObject{
+	resp := &ResponsesObject{
 		ID:                 id,
 		Object:             "response",
 		CreatedAt:          time.Now().Unix(),
 		Status:             "completed",
 		Model:              model,
 		Output:             output,
-		Usage:              ResponsesUsage{InputTokens: inputTokens, OutputTokens: outputTokens, TotalTokens: inputTokens + outputTokens},
+		Usage: ResponsesUsage{
+			InputTokens:  inputTokens,
+			OutputTokens: outputTokens,
+			TotalTokens:  inputTokens + outputTokens,
+		},
 		PreviousResponseID: req.PreviousResponseID,
 		Metadata:           req.Metadata,
 	}
+
+	// 官方语义：input_tokens 报全量输入，缓存命中单列。
+	if cachedTokens > 0 {
+		resp.Usage.InputTokensDetails = &ResponsesInputTokensDetails{CachedTokens: cachedTokens}
+	}
+	return resp
 }
 
 func (h *Handler) handleResponsesStream(
 	w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
-	estimatedInputTokens int, apiKeyID, convID, respID string,
+	estimatedInputTokens int, gptProfile *promptCacheProfile, apiKeyID, convID, convSource, respID string,
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
 ) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
@@ -323,7 +395,9 @@ func (h *Handler) handleResponsesStream(
 	reqStart := time.Now()
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.SelectForConversation(convID, model, excluded)
+		account, affinityReason := h.pool.SelectForConversationWithReason(convID, model, excluded)
+		logger.Infof("[Responses] route model=%s source=%s conv=%s reason=%s account=%s attempt=%d",
+			model, convSource, responsesConversationLogID(convID), affinityReason, responsesAccountLogID(account), attempt+1)
 		if account == nil {
 			break
 		}
@@ -339,6 +413,8 @@ func (h *Handler) handleResponsesStream(
 			"response": initial,
 		})
 
+		gptUsage := h.promptCache.Compute(account.ID, gptProfile)
+
 		var (
 			fullText        strings.Builder
 			reasoningText   strings.Builder
@@ -347,6 +423,7 @@ func (h *Handler) handleResponsesStream(
 			outputTokens    int
 			credits         float64
 			realInputTokens int
+			upstreamUsage   KiroTokenUsage
 		)
 
 		messageItemID := generateOutputItemID("msg")
@@ -471,8 +548,9 @@ func (h *Handler) handleResponsesStream(
 			OnComplete: func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
 			OnCredits:  func(c float64) { credits = c },
 			OnContextUsage: func(pct float64) {
-				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+				realInputTokens = int(pct * float64(h.effectiveContextWindow(model)) / 100.0)
 			},
+			OnTokenUsage: func(usage KiroTokenUsage) { upstreamUsage = usage },
 		}
 
 		err := CallKiroAPI(account, payload, callback)
@@ -537,17 +615,22 @@ func (h *Handler) handleResponsesStream(
 			inputTokens = estimatedInputTokens
 		}
 		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoning, toolUses)
+		logger.Infof("[Responses] complete model=%s conv=%s account=%s input=%d output=%d upstream_input=%d uncached=%d cache_read=%d cache_write=%d cache_creation=%d cache_fields_present=%t",
+			model, responsesConversationLogID(convID), account.ID, inputTokens, outputTokens, upstreamUsage.InputTokens,
+			upstreamUsage.UncachedInputTokens, upstreamUsage.CacheReadInputTokens, upstreamUsage.CacheWriteInputTokens,
+			upstreamUsage.CacheCreationInputTokens, upstreamUsage.CacheFieldsPresent)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
-		h.pool.Remember(convID, account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.recordSuccessLog("responses", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.promptCache.Update(account.ID, gptProfile)
 
-		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req)
+		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req, gptUsage.CacheReadInputTokens)
 		respObj.CreatedAt = createdAt
 		respObj.StoredInput = storedInput
 		respObj.Instructions = req.Instructions
+		h.rememberResponsesAccount(convID, respObj, account.ID)
 
 		if storeResponse {
 			if saveErr := saveResponse(respObj); saveErr != nil {

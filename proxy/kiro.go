@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -232,6 +233,16 @@ type InferenceConfig struct {
 // ==================== Stream Callbacks ====================
 
 // KiroStreamCallback stream response callbacks
+type KiroTokenUsage struct {
+	InputTokens              int
+	OutputTokens             int
+	UncachedInputTokens      int
+	CacheReadInputTokens     int
+	CacheWriteInputTokens    int
+	CacheCreationInputTokens int
+	CacheFieldsPresent       bool
+}
+
 type KiroStreamCallback struct {
 	OnText         func(text string, isThinking bool)
 	OnToolUse      func(toolUse KiroToolUse)
@@ -239,6 +250,7 @@ type KiroStreamCallback struct {
 	OnError        func(err error)
 	OnCredits      func(credits float64)
 	OnContextUsage func(percentage float64)
+	OnTokenUsage   func(usage KiroTokenUsage)
 }
 
 // ==================== API Call ====================
@@ -422,9 +434,15 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 	// Read directly without bufio to avoid buffering latency in streaming responses.
 	var inputTokens, outputTokens int
 	var totalCredits float64
+	var tokenUsage KiroTokenUsage
 	var currentToolUse *toolUseState
 	var lastAssistantContent string
 	var lastReasoningContent string
+
+	// Debug diagnostics for prompt-cache investigation: track which raw
+	// token/usage/cache fields the upstream actually reports, so we can tell
+	// "supplier returns no cache stats" apart from "we parse a different shape".
+	seenUsageFields := make(map[string]bool)
 
 	for {
 		// Prelude: 12 bytes (total_len + headers_len + crc)
@@ -468,6 +486,14 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 		}
 
 		inputTokens, outputTokens = updateTokensFromEvent(event, inputTokens, outputTokens)
+		updateTokenUsageFromEvent(event, &tokenUsage)
+
+		if fields := usageFieldsInEvent(event); fields != "" {
+			for _, f := range strings.Split(fields, ",") {
+				seenUsageFields[f] = true
+			}
+			logger.Debugf("[KiroAPI] event type=%s tokenUsageFields=%s", eventType, fields)
+		}
 
 		// Dispatch by event type.
 		switch eventType {
@@ -511,7 +537,119 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 	if callback.OnComplete != nil {
 		callback.OnComplete(inputTokens, outputTokens)
 	}
+	tokenUsage.InputTokens = inputTokens
+	tokenUsage.OutputTokens = outputTokens
+
+	// One-line per-stream summary: the union of raw usage fields the upstream
+	// reported, and what our parser extracted from them. usageFields="" means
+	// the upstream sent no token/usage/cache fields at all for this request.
+	fieldNames := make([]string, 0, len(seenUsageFields))
+	for f := range seenUsageFields {
+		fieldNames = append(fieldNames, f)
+	}
+	sort.Strings(fieldNames)
+	logger.Infof("[KiroAPI] stream done usageFields=[%s] input=%d output=%d uncached=%d cache_read=%d cache_write=%d cache_creation=%d cache_fields_present=%t",
+		strings.Join(fieldNames, ","), tokenUsage.InputTokens, tokenUsage.OutputTokens,
+		tokenUsage.UncachedInputTokens, tokenUsage.CacheReadInputTokens, tokenUsage.CacheWriteInputTokens,
+		tokenUsage.CacheCreationInputTokens, tokenUsage.CacheFieldsPresent)
+
+	if callback.OnTokenUsage != nil {
+		callback.OnTokenUsage(tokenUsage)
+	}
 	return nil
+}
+
+func updateTokenUsageFromEvent(event map[string]interface{}, result *KiroTokenUsage) {
+	if result == nil {
+		return
+	}
+	candidates := []map[string]interface{}{event}
+	collectUsageMaps(event, &candidates)
+	for _, usage := range candidates {
+		if usage == nil {
+			continue
+		}
+		if v, ok := readTokenNumber(usage, "inputTokens", "promptTokens", "totalInputTokens", "input_tokens", "prompt_tokens", "total_input_tokens"); ok {
+			result.InputTokens = v
+		}
+		if v, ok := readTokenNumber(usage, "outputTokens", "completionTokens", "totalOutputTokens", "output_tokens", "completion_tokens", "total_output_tokens"); ok {
+			result.OutputTokens = v
+		}
+		if v, ok := readTokenNumber(usage, "uncachedInputTokens", "uncached_input_tokens"); ok {
+			result.UncachedInputTokens = v
+		}
+		if v, ok := readTokenNumber(usage, "cacheReadInputTokens", "cache_read_input_tokens"); ok {
+			result.CacheReadInputTokens = v
+			result.CacheFieldsPresent = true
+		} else if hasTokenField(usage, "cacheReadInputTokens", "cache_read_input_tokens") {
+			result.CacheFieldsPresent = true
+		}
+		if v, ok := readTokenNumber(usage, "cacheWriteInputTokens", "cache_write_input_tokens"); ok {
+			result.CacheWriteInputTokens = v
+			result.CacheFieldsPresent = true
+		} else if hasTokenField(usage, "cacheWriteInputTokens", "cache_write_input_tokens") {
+			result.CacheFieldsPresent = true
+		}
+		if v, ok := readTokenNumber(usage, "cacheCreationInputTokens", "cache_creation_input_tokens"); ok {
+			result.CacheCreationInputTokens = v
+			result.CacheFieldsPresent = true
+		} else if hasTokenField(usage, "cacheCreationInputTokens", "cache_creation_input_tokens") {
+			result.CacheFieldsPresent = true
+		}
+		if hasTokenField(usage, "uncachedInputTokens", "uncached_input_tokens") {
+			result.CacheFieldsPresent = true
+		}
+	}
+}
+
+// usageFieldsInEvent returns a sorted, comma-separated list of every field at
+// any depth whose key mentions token, usage, or cache (case-insensitive) — i.e.
+// everything the upstream could be reporting as token accounting. Returns ""
+// when the event carries none. Used for DEBUG diagnostics to see the raw shape
+// of the upstream usage structure regardless of what our parser looks for.
+func usageFieldsInEvent(event map[string]interface{}) string {
+	names := make(map[string]bool)
+	var walk func(prefix string, v interface{})
+	walk = func(prefix string, v interface{}) {
+		switch t := v.(type) {
+		case map[string]interface{}:
+			for k, child := range t {
+				full := k
+				if prefix != "" {
+					full = prefix + "." + k
+				}
+				if strings.Contains(strings.ToLower(k), "token") ||
+					strings.Contains(strings.ToLower(k), "usage") ||
+					strings.Contains(strings.ToLower(k), "cache") {
+					names[full] = true
+				}
+				walk(full, child)
+			}
+		case []interface{}:
+			for i, child := range t {
+				walk(fmt.Sprintf("%s[%d]", prefix, i), child)
+			}
+		}
+	}
+	walk("", event)
+	if len(names) == 0 {
+		return ""
+	}
+	sorted := make([]string, 0, len(names))
+	for name := range names {
+		sorted = append(sorted, name)
+	}
+	sort.Strings(sorted)
+	return strings.Join(sorted, ",")
+}
+
+func hasTokenField(m map[string]interface{}, keys ...string) bool {
+	for _, key := range keys {
+		if _, ok := m[key]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func updateTokensFromEvent(event map[string]interface{}, currentInputTokens, currentOutputTokens int) (int, int) {
@@ -538,7 +676,6 @@ func updateTokensFromEvent(event map[string]interface{}, currentInputTokens, cur
 			"input_tokens", "prompt_tokens", "total_input_tokens",
 		); ok {
 			inputTokens = v
-			continue
 		}
 
 		uncached, _ := readTokenNumber(usage, "uncachedInputTokens", "uncached_input_tokens")

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"kiro-go/config"
-	"kiro-go/logger"
 	"net/http"
 	"strings"
 	"time"
@@ -118,8 +117,6 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	// 会话亲和：三级解析 convID——显式会话 ID（header/query/metadata conversation_id）
 	// > previous_response_id 链根 > 内容锚点（基于组装后的完整消息列表）。
 	convID, convSource := ResolveResponsesConversationIDWithSource(r, actualModel, finalMessages, &req)
-	logger.Infof("[Responses] request model=%s stream=%t source=%s conv=%s previous_response_id_present=%t messages=%d",
-		actualModel, req.Stream, convSource, responsesConversationLogID(convID), req.PreviousResponseID != "", len(finalMessages))
 
 	// GPT 缓存命中模拟：与 Chat 路径共用同一个 OpenAIRequest 构建器。
 	gptProfile := h.promptCache.BuildOpenAIProfile(openaiReq, estimatedInputTokens, perMsgTokens)
@@ -134,24 +131,6 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 		apiKeyID, convID, convSource, respID, &req, storedInputCopy, storeResponse)
 }
 
-func responsesConversationLogID(id string) string {
-	id = strings.TrimSpace(id)
-	if id == "" {
-		return "<empty>"
-	}
-	if len(id) > 32 {
-		return id[:32] + "..."
-	}
-	return id
-}
-
-func responsesAccountLogID(account *config.Account) string {
-	if account == nil {
-		return "<nil>"
-	}
-	return account.ID
-}
-
 func (h *Handler) handleResponsesNonStream(
 	w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
 	estimatedInputTokens int, gptProfile *promptCacheProfile, apiKeyID, convID, convSource, respID string,
@@ -162,9 +141,7 @@ func (h *Handler) handleResponsesNonStream(
 	reqStart := time.Now()
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account, affinityReason := h.pool.SelectForConversationWithReason(convID, model, excluded)
-		logger.Infof("[Responses] route model=%s source=%s conv=%s reason=%s account=%s attempt=%d",
-			model, convSource, responsesConversationLogID(convID), affinityReason, responsesAccountLogID(account), attempt+1)
+		account := h.pool.SelectForConversation(convID, model, excluded)
 		if account == nil {
 			break
 		}
@@ -182,7 +159,6 @@ func (h *Handler) handleResponsesNonStream(
 		var inputTokens, outputTokens int
 		var credits float64
 		var realInputTokens int
-		var upstreamUsage KiroTokenUsage
 
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
@@ -198,7 +174,6 @@ func (h *Handler) handleResponsesNonStream(
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(h.effectiveContextWindow(model)) / 100.0)
 			},
-			OnTokenUsage: func(usage KiroTokenUsage) { upstreamUsage = usage },
 		}
 
 		err := CallKiroAPI(account, payload, callback)
@@ -220,10 +195,6 @@ func (h *Handler) handleResponsesNonStream(
 			inputTokens = estimatedInputTokens
 		}
 		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
-		logger.Infof("[Responses] complete model=%s conv=%s account=%s input=%d output=%d upstream_input=%d uncached=%d cache_read=%d cache_write=%d cache_creation=%d cache_fields_present=%t",
-			model, responsesConversationLogID(convID), account.ID, inputTokens, outputTokens, upstreamUsage.InputTokens,
-			upstreamUsage.UncachedInputTokens, upstreamUsage.CacheReadInputTokens, upstreamUsage.CacheWriteInputTokens,
-			upstreamUsage.CacheCreationInputTokens, upstreamUsage.CacheFieldsPresent)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
@@ -395,9 +366,7 @@ func (h *Handler) handleResponsesStream(
 	reqStart := time.Now()
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account, affinityReason := h.pool.SelectForConversationWithReason(convID, model, excluded)
-		logger.Infof("[Responses] route model=%s source=%s conv=%s reason=%s account=%s attempt=%d",
-			model, convSource, responsesConversationLogID(convID), affinityReason, responsesAccountLogID(account), attempt+1)
+		account := h.pool.SelectForConversation(convID, model, excluded)
 		if account == nil {
 			break
 		}
@@ -423,7 +392,6 @@ func (h *Handler) handleResponsesStream(
 			outputTokens    int
 			credits         float64
 			realInputTokens int
-			upstreamUsage   KiroTokenUsage
 		)
 
 		messageItemID := generateOutputItemID("msg")
@@ -550,7 +518,6 @@ func (h *Handler) handleResponsesStream(
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(h.effectiveContextWindow(model)) / 100.0)
 			},
-			OnTokenUsage: func(usage KiroTokenUsage) { upstreamUsage = usage },
 		}
 
 		err := CallKiroAPI(account, payload, callback)
@@ -615,10 +582,6 @@ func (h *Handler) handleResponsesStream(
 			inputTokens = estimatedInputTokens
 		}
 		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoning, toolUses)
-		logger.Infof("[Responses] complete model=%s conv=%s account=%s input=%d output=%d upstream_input=%d uncached=%d cache_read=%d cache_write=%d cache_creation=%d cache_fields_present=%t",
-			model, responsesConversationLogID(convID), account.ID, inputTokens, outputTokens, upstreamUsage.InputTokens,
-			upstreamUsage.UncachedInputTokens, upstreamUsage.CacheReadInputTokens, upstreamUsage.CacheWriteInputTokens,
-			upstreamUsage.CacheCreationInputTokens, upstreamUsage.CacheFieldsPresent)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)

@@ -838,41 +838,6 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	convID := ResolveClaudeConversationID(r, &req)
 
-	// TEMP DEBUG
-	{
-		lastRole, lastType := "", ""
-		if len(req.Messages) > 0 {
-			lm := req.Messages[len(req.Messages)-1]
-			lastRole = lm.Role
-			switch v := lm.Content.(type) {
-			case string:
-				lastType = "string"
-			case []interface{}:
-				ts := make([]string, 0, len(v))
-				for _, b := range v {
-					if bm, ok := b.(map[string]interface{}); ok {
-						if t, _ := bm["type"].(string); t != "" {
-							ts = append(ts, t)
-						}
-					}
-				}
-				lastType = strings.Join(ts, ",")
-			}
-		}
-		hasReminder := false
-		for i := len(req.Messages) - 1; i >= 0 && i >= len(req.Messages)-3; i-- {
-			if req.Messages[i].Role == "system" {
-				hasReminder = true
-				break
-			}
-		}
-		cid := convID
-		if len(cid) > 12 {
-			cid = cid[:12]
-		}
-		dbgLog("REQ conv=%s tools=%d msgs=%d lastRole=%s lastType=%s reminderAtEnd=%v", cid, len(req.Tools), len(req.Messages), lastRole, lastType, hasReminder)
-	}
-
 	if req.Stream {
 		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, convID)
 	} else {
@@ -1718,7 +1683,6 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		var inputTokens, outputTokens int
 		var credits float64
 		var realInputTokens int
-		var upstreamUsage KiroTokenUsage
 		var rawContentBuilder strings.Builder
 		var rawReasoningBuilder strings.Builder
 		var textBuffer string
@@ -1993,7 +1957,6 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(h.effectiveContextWindow(model)) / 100.0)
 			},
-			OnTokenUsage: func(usage KiroTokenUsage) { upstreamUsage = usage },
 		}
 
 		err := CallKiroAPI(account, payload, callback)
@@ -2031,11 +1994,6 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			outputTokens += bpeTokenCountGPT(tc.Function.Name)
 			outputTokens += bpeTokenCountGPT(tc.Function.Arguments)
 		}
-
-		logger.Infof("[OpenAI] complete model=%s account=%s input=%d output=%d upstream_input=%d uncached=%d cache_read=%d cache_write=%d cache_creation=%d cache_fields_present=%t",
-			model, account.ID, inputTokens, outputTokens, upstreamUsage.InputTokens,
-			upstreamUsage.UncachedInputTokens, upstreamUsage.CacheReadInputTokens, upstreamUsage.CacheWriteInputTokens,
-			upstreamUsage.CacheCreationInputTokens, upstreamUsage.CacheFieldsPresent)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
@@ -2103,7 +2061,6 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		var inputTokens, outputTokens int
 		var credits float64
 		var realInputTokens int
-		var upstreamUsage KiroTokenUsage
 
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
@@ -2119,7 +2076,6 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(h.effectiveContextWindow(model)) / 100.0)
 			},
-			OnTokenUsage: func(usage KiroTokenUsage) { upstreamUsage = usage },
 		}
 
 		err := CallKiroAPI(account, payload, callback)
@@ -2143,11 +2099,6 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			inputTokens = estimatedInputTokens
 		}
 		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
-
-		logger.Infof("[OpenAI] complete model=%s account=%s input=%d output=%d upstream_input=%d uncached=%d cache_read=%d cache_write=%d cache_creation=%d cache_fields_present=%t",
-			model, account.ID, inputTokens, outputTokens, upstreamUsage.InputTokens,
-			upstreamUsage.UncachedInputTokens, upstreamUsage.CacheReadInputTokens, upstreamUsage.CacheWriteInputTokens,
-			upstreamUsage.CacheCreationInputTokens, upstreamUsage.CacheFieldsPresent)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)

@@ -110,31 +110,32 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(openaiReq)
 	kiroPayload := OpenAIToKiro(openaiReq, thinking)
+	convID := ResolveOpenAIConversationID(openaiReq)
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	respID := generateResponseID()
 
 	if req.Stream {
 		h.handleResponsesStream(r.Context(), w, kiroPayload, actualModel, thinking, estimatedInputTokens,
-			apiKeyID, respID, &req, storedInputCopy, storeResponse)
+			apiKeyID, respID, &req, storedInputCopy, storeResponse, convID)
 		return
 	}
 
 	h.handleResponsesNonStream(r.Context(), w, kiroPayload, actualModel, thinking, estimatedInputTokens,
-		apiKeyID, respID, &req, storedInputCopy, storeResponse)
+		apiKeyID, respID, &req, storedInputCopy, storeResponse, convID)
 }
 
 func (h *Handler) handleResponsesNonStream(
 	ctx context.Context, w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
 	estimatedInputTokens int, apiKeyID, respID string,
-	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
+	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool, convID string,
 ) {
 	excluded := make(map[string]bool)
 	var lastErr error
 	reqStart := time.Now()
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
+		account := h.pool.SelectForConversation(convID, model, excluded)
 		if account == nil {
 			break
 		}
@@ -216,6 +217,7 @@ func (h *Handler) handleResponsesNonStream(
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
+		h.pool.Remember(convID, account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		cacheDetails := resolveOpenAICacheUsage(h.promptCache, account.ID, payload, inputTokens)
 		h.recordSuccessLog("responses", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
@@ -321,7 +323,7 @@ func buildResponsesObject(
 func (h *Handler) handleResponsesStream(
 	ctx context.Context, w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
 	estimatedInputTokens int, apiKeyID, respID string,
-	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
+	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool, convID string,
 ) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -365,7 +367,7 @@ func (h *Handler) handleResponsesStream(
 	reqStart := time.Now()
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
+		account := h.pool.SelectForConversation(convID, model, excluded)
 		if account == nil {
 			break
 		}
@@ -612,6 +614,7 @@ func (h *Handler) handleResponsesStream(
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
+		h.pool.Remember(convID, account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		cacheDetails := resolveOpenAICacheUsage(h.promptCache, account.ID, payload, inputTokens)
 		h.recordSuccessLog("responses", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())

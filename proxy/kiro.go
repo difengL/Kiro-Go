@@ -379,6 +379,9 @@ func CallKiroAPIContext(ctx context.Context, account *config.Account, payload *K
 	// Debug: dump full payload for troubleshooting upstream rejections
 	if payloadJSON, err := json.Marshal(payload); err == nil {
 		logger.Debugf("[KiroAPI] Request payload: %s", string(payloadJSON))
+		// ========== [TOKEN DEBUG] 发给 Kiro 上游的实际报文 ==========
+		logger.Infof("[TokenDebug][Upstream] 发给 Kiro 的实际报文 (length=%d bytes, 约 %d 估算 tokens):\n%s",
+			len(payloadJSON), estimateApproxTokens(string(payloadJSON)), string(payloadJSON))
 	}
 
 	// Wrap OnToolUse to restore original tool names for the client.
@@ -649,6 +652,8 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 		}
 
 		inputTokens, outputTokens = updateTokensFromEvent(event, inputTokens, outputTokens)
+		logger.Infof("[TokenDebug][Upstream] event-type=%s, 累计 inputTokens=%d, outputTokens=%d, 原始 event usage: %v",
+			headers[":event-type"], inputTokens, outputTokens, extractUsageFromEvent(event))
 
 		switch headers[":event-type"] {
 		case "assistantResponseEvent":
@@ -681,6 +686,9 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 		case "contextUsageEvent":
 			if pct, ok := event["contextUsagePercentage"].(float64); ok {
 				contextUsagePercentages = append(contextUsagePercentages, pct)
+				// ========== [TOKEN DEBUG] contextUsageEvent 原始数据 ==========
+				eventJSON, _ := json.Marshal(event)
+				logger.Infof("[TokenDebug][Upstream] contextUsageEvent 原始数据: percentage=%.6f%%, 完整 event: %s", pct, string(eventJSON))
 			}
 		case "metadataEvent":
 			// stopReason rides inside metadataEvent on the wire; there is no
@@ -764,6 +772,36 @@ func updateTokensFromEvent(event map[string]interface{}, currentInputTokens, cur
 	}
 
 	return inputTokens, outputTokens
+}
+
+// extractUsageFromEvent extracts the usage-related fields from an event for logging purposes.
+func extractUsageFromEvent(event map[string]interface{}) map[string]interface{} {
+	usage := make(map[string]interface{})
+	usageKeys := []string{
+		"inputTokens", "outputTokens", "totalTokens",
+		"cacheReadInputTokens", "cacheWriteInputTokens", "cacheCreationInputTokens",
+		"uncachedInputTokens", "promptTokens", "completionTokens",
+		"input_tokens", "output_tokens", "total_tokens",
+		"cache_read_input_tokens", "cache_write_input_tokens", "cache_creation_input_tokens",
+		"uncached_input_tokens", "prompt_tokens", "completion_tokens",
+	}
+	if u, ok := event["usage"]; ok {
+		if uMap, ok := u.(map[string]interface{}); ok {
+			for _, key := range usageKeys {
+				if v, exists := uMap[key]; exists {
+					usage[key] = v
+				}
+			}
+			return usage
+		}
+	}
+	// Also check top-level usage fields
+	for _, key := range usageKeys {
+		if v, exists := event[key]; exists {
+			usage[key] = v
+		}
+	}
+	return usage
 }
 
 // getContextWindowSize returns the context window size (in tokens) for a model.

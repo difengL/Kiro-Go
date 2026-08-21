@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"kiro-go/config"
+	"net/http"
 	"regexp"
 	"strings"
 	"time"
@@ -617,6 +618,26 @@ func extractSystemPrompt(system interface{}) string {
 			}
 		}
 		return strings.Join(parts, "\n")
+	}
+	return ""
+}
+
+// firstClaudeSystemPrompt 只取首个 system block 的文本，用于会话亲和锚点。
+// 与 extractSystemPrompt（上游转换用，须全量拼接）不同：Claude Code 等客户端
+// 会在后续 system block 注入动态内容（cwd/git 状态/日期/提醒），全量拼接会
+// 导致锚点每轮漂移；而首个 block 会话内稳定。
+func firstClaudeSystemPrompt(system interface{}) string {
+	if s, ok := system.(string); ok {
+		return s
+	}
+	if blocks, ok := system.([]interface{}); ok {
+		for _, b := range blocks {
+			if block, ok := b.(map[string]interface{}); ok {
+				if text, ok := block["text"].(string); ok {
+					return text
+				}
+			}
+		}
 	}
 	return ""
 }
@@ -1930,29 +1951,58 @@ func buildConversationID(modelID, systemPrompt, anchor string) string {
 	return uuid.NewSHA1(uuid.NameSpaceURL, []byte(seed)).String()
 }
 
-// ResolveClaudeConversationID returns a deterministic conversation key for
-// affinity routing. Returns "" for synthetic/absent anchors (skip affinity).
-// Does NOT change buildConversationID's upstream-facing behavior.
-func ResolveClaudeConversationID(req *ClaudeRequest) string {
-	if req == nil {
+// explicitConversationIDFromRequest 从请求提取客户端显式指定的会话 ID。
+// 优先级：x-claude-code-session-id（Claude Code 官方会话标识，稳定且无需解析
+// body）> query 参数 conversation_id > 请求头 X-Kiro-Conversation-Id。
+// 未指定返回 ""。
+func explicitConversationIDFromRequest(r *http.Request) string {
+	if r == nil {
 		return ""
 	}
-	anchor := firstClaudeConversationAnchor(req.Messages)
-	if isSyntheticConversationAnchor(anchor) {
-		return ""
+	if sid := r.Header.Get("x-claude-code-session-id"); sid != "" {
+		return sid
 	}
-	return buildConversationID(req.Model, extractSystemPrompt(req.System), anchor)
+	if cid := r.URL.Query().Get("conversation_id"); cid != "" {
+		return cid
+	}
+	if cid := r.Header.Get("X-Kiro-Conversation-Id"); cid != "" {
+		return cid
+	}
+	return ""
 }
 
-// ResolveOpenAIConversationID returns a deterministic conversation key for
-// affinity routing. Returns "" for synthetic/absent anchors.
-func ResolveOpenAIConversationID(req *OpenAIRequest) string {
-	if req == nil {
+// buildExplicitConversationID 将显式会话 ID 哈希为亲和 key（命名空间 sess_）。
+func buildExplicitConversationID(cid string) string {
+	return "sess_" + uuid.NewSHA1(uuid.NameSpaceURL, []byte(cid)).String()
+}
+
+// buildRootConversationID 将 Responses 链根 response ID 用作亲和 key（命名空间 root_）。
+func buildRootConversationID(rootID string) string {
+	return "root_" + rootID
+}
+
+// resolveChainRoot 沿 previous_response_id 向上取链根 response 的 ID。
+// 父 response 不可用（如过期）时退化为父 ID 本身。
+func resolveChainRoot(prevID string) string {
+	if prevID == "" {
 		return ""
 	}
+	prev, err := loadResponse(prevID)
+	if err != nil {
+		return prevID
+	}
+	if prev.RootResponseID != "" {
+		return prev.RootResponseID
+	}
+	return prev.ID
+}
+
+// resolveConversationID 计算内容锚点会话 key：模型 + system 文本 + 首个非空 user 锚点。
+// 合成锚点返回 ""（跳过亲和）。命名空间前缀 anch_。
+func resolveConversationID(model string, messages []OpenAIMessage) string {
 	var nonSystem []OpenAIMessage
 	var systemText string
-	for _, m := range req.Messages {
+	for _, m := range messages {
 		if m.Role == "system" {
 			systemText += extractOpenAIMessageText(m.Content)
 			continue
@@ -1963,7 +2013,61 @@ func ResolveOpenAIConversationID(req *OpenAIRequest) string {
 	if isSyntheticConversationAnchor(anchor) {
 		return ""
 	}
-	return buildConversationID(req.Model, systemText, anchor)
+	return "anch_" + buildConversationID(model, systemText, anchor)
+}
+
+// ResolveClaudeConversationID returns a deterministic conversation key for
+// affinity routing. Returns "" for synthetic/absent anchors (skip affinity).
+// 优先级：显式会话 ID（x-claude-code-session-id / header / query）> 内容锚点。
+// 内容锚点的 system 部分只取首块，避免 Claude Code 动态 system 内容导致漂移。
+// r 可为 nil（跳过显式检查）。
+func ResolveClaudeConversationID(r *http.Request, req *ClaudeRequest) string {
+	if req == nil {
+		return ""
+	}
+	if cid := explicitConversationIDFromRequest(r); cid != "" {
+		return buildExplicitConversationID(cid)
+	}
+	anchor := firstClaudeConversationAnchor(req.Messages)
+	if isSyntheticConversationAnchor(anchor) {
+		return ""
+	}
+	return "anch_" + buildConversationID(req.Model, firstClaudeSystemPrompt(req.System), anchor)
+}
+
+// ResolveOpenAIConversationID returns a deterministic conversation key for
+// affinity routing. Returns "" for synthetic/absent anchors.
+// 优先级：显式会话 ID（header/query）> 内容锚点。r 可为 nil。
+func ResolveOpenAIConversationID(r *http.Request, req *OpenAIRequest) string {
+	if req == nil {
+		return ""
+	}
+	if cid := explicitConversationIDFromRequest(r); cid != "" {
+		return buildExplicitConversationID(cid)
+	}
+	return resolveConversationID(req.Model, req.Messages)
+}
+
+// ResolveResponsesConversationID returns a deterministic conversation key for
+// affinity routing of OpenAI Responses API requests. messages 应为组装后的完整
+// 消息列表（previous_response_id 展开的历史 + instructions + input）。
+// 优先级：显式会话 ID（header/query > metadata conversation_id）>
+// previous_response_id 链根 > 内容锚点。Returns "" for synthetic/absent anchors.
+func ResolveResponsesConversationID(r *http.Request, model string, messages []OpenAIMessage, req *ResponsesRequest) string {
+	if cid := explicitConversationIDFromRequest(r); cid != "" {
+		return buildExplicitConversationID(cid)
+	}
+	if req != nil {
+		if cid := req.Metadata["conversation_id"]; cid != "" {
+			return buildExplicitConversationID(cid)
+		}
+		if req.PreviousResponseID != "" {
+			if root := resolveChainRoot(req.PreviousResponseID); root != "" {
+				return buildRootConversationID(root)
+			}
+		}
+	}
+	return resolveConversationID(model, messages)
 }
 
 func isSyntheticConversationAnchor(anchor string) bool {

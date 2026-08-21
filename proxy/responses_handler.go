@@ -110,7 +110,10 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(openaiReq)
 	kiroPayload := OpenAIToKiro(openaiReq, thinking)
-	convID := ResolveOpenAIConversationID(openaiReq)
+
+	// 会话亲和：三级解析 convID——显式会话 ID（header/query/metadata conversation_id）
+	// > previous_response_id 链根 > 内容锚点（基于组装后的完整消息列表）。
+	convID := ResolveResponsesConversationID(r, actualModel, finalMessages, &req)
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	respID := generateResponseID()
@@ -142,7 +145,7 @@ func (h *Handler) handleResponsesNonStream(
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			h.failAccount(convID, account, err)
 			continue
 		}
 
@@ -198,7 +201,7 @@ func (h *Handler) handleResponsesNonStream(
 			excluded[account.ID] = true
 			// Integrity failures are upstream hiccups, not account faults.
 			if !isStreamIntegrityError(err) {
-				h.handleAccountFailure(account, err)
+				h.failAccount(convID, account, err)
 			}
 			continue
 		}
@@ -374,7 +377,7 @@ func (h *Handler) handleResponsesStream(
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			h.failAccount(convID, account, err)
 			continue
 		}
 
@@ -553,7 +556,7 @@ func (h *Handler) handleResponsesStream(
 				excluded[account.ID] = true
 				// Integrity failures are upstream hiccups, not account faults.
 				if !isStreamIntegrityError(err) {
-					h.handleAccountFailure(account, err)
+					h.failAccount(convID, account, err)
 				}
 				continue
 			}

@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"fmt"
 	"math"
 )
 
@@ -193,4 +194,13 @@ func estimateOpenAIContentTokens(content interface{}) int {
 
 func estimateOpenAIOutputTokens(content, reasoningContent string, toolUses []KiroToolUse) int {
 	return estimateClaudeOutputTokens(content, reasoningContent, toolUses)
+}
+
+// truncateForLog truncates a string for log display, keeping it readable.
+func truncateForLog(s string) string {
+	const maxLen = 200
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "...(truncated, total=" + fmt.Sprintf("%d", len(s)) + " chars)"
 }

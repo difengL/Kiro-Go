@@ -278,9 +278,14 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 	return best
 }
 
+// affinityShortCooldown 亲和失败后对坏号的即时短期冷却时长。
+// 第一次失败即生效（不等现有 cooldowns 的 3 次错误阈值），
+// 够短避免偶发抖动误伤、够长实现跨请求坏号记忆。
+const affinityShortCooldown = 30 * time.Second
+
 // SelectForConversation 选择账号：先亲和命中，否则加权轮询。
 // convID 为空时退化为 GetNextForModelExcluding（兼容合成锚点）。
-// 亲和命中但账号不可用时，自动迁移到轮询选出的新号。
+// 亲和命中但账号不可用时，立即解绑并迁移到轮询选出的新号。
 // 绑定由 handler 在请求成功后调 Remember 完成。
 func (p *AccountPool) SelectForConversation(convID, model string, excluded map[string]bool) *config.Account {
 	// 亲和未启用或空 key：直接轮询
@@ -300,10 +305,29 @@ func (p *AccountPool) SelectForConversation(convID, model string, excluded map[s
 		if usable {
 			return acc // 亲和命中，cache 窗口成立
 		}
-		// 不可用：迁移，落 to 轮询
+		// 不可用：立即解绑（读路径兜底，防死绑定残留），迁移到轮询
+		// 注意：lookup 已释放 affinity 锁，此处重新加锁，不与 p.mu 嵌套。
+		p.affinity.unbind(convID)
 	}
 	// 3. 轮询
 	return p.GetNextForModelExcluding(model, excluded)
+}
+
+// RecordAffinityFailure 在请求失败时解绑会话并给坏号一个即时短期冷却。
+// 冷却取现有冷却与 affinityShortCooldown 中更长的，避免覆盖配额等长冷却。
+// convID 为空或亲和未启用时仅保留冷却行为（unbind 空 key 是安全阀）。
+func (p *AccountPool) RecordAffinityFailure(convID, accountID string) {
+	p.mu.Lock()
+	if accountID != "" {
+		if cd, ok := p.cooldowns[accountID]; !ok || time.Now().Add(affinityShortCooldown).After(cd) {
+			p.cooldowns[accountID] = time.Now().Add(affinityShortCooldown)
+		}
+	}
+	p.mu.Unlock()
+
+	if config.GetAffinityEnabled() && convID != "" {
+		p.affinity.unbind(convID)
+	}
 }
 
 // Remember 在请求成功后绑定 convID→accountID，刷新 lastUsed。

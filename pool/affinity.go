@@ -73,3 +73,14 @@ func (a *affinityRouter) setTTL(ttl time.Duration) {
 	defer a.mu.Unlock()
 	a.ttl = ttl
 }
+
+// unbind 删除 convID 的绑定（无论是否过期）。空 key 直接 return。
+// 用于坏号失败后立即解绑，避免死绑定占据 TTL 窗口。
+func (a *affinityRouter) unbind(convID string) {
+	if convID == "" {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.bindings, convID)
+}

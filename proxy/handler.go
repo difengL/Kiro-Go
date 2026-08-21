@@ -1399,9 +1399,17 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			truncateForLog(outputContent), estimateApproxTokens(outputContent),
 			truncateForLog(thinkingOutput), estimateApproxTokens(thinkingOutput), len(toolUses))
 		logger.Infof("[TokenDebug][Claude][Stream] 最终 outputTokens=%d (本地重新估算, 非上游值)", outputTokens)
-		logger.Infof("[TokenDebug][Claude][Stream] Cache 计算结果: CacheRead=%d, CacheCreation=%d, 5m=%d, 1h=%d",
+		logger.Infof("[TokenDebug][Claude][Stream] Cache 计算结果(缩放前): CacheRead=%d, CacheCreation=%d, 5m=%d, 1h=%d",
 			cacheUsage.CacheReadInputTokens, cacheUsage.CacheCreationInputTokens,
 			cacheUsage.CacheCreation5mInputTokens, cacheUsage.CacheCreation1hInputTokens)
+		// 按比例缩放 cache 值到真实 input 尺度
+		if cacheProfile != nil {
+			scaleCacheUsageToRealInput(&cacheUsage, cacheProfile.TotalInputTokens, inputTokens)
+			logger.Infof("[TokenDebug][Claude][Stream] Cache 缩放: localTotalEstimate=%d, realInputTokens=%d, 缩放后 CacheRead=%d, CacheCreation=%d, 5m=%d, 1h=%d",
+				cacheProfile.TotalInputTokens, inputTokens,
+				cacheUsage.CacheReadInputTokens, cacheUsage.CacheCreationInputTokens,
+				cacheUsage.CacheCreation5mInputTokens, cacheUsage.CacheCreation1hInputTokens)
+		}
 		billedInput := billedClaudeInputTokens(inputTokens, cacheUsage)
 		logger.Infof("[TokenDebug][Claude][Stream] 最终 billed input_tokens = inputTokens(%d) - CacheCreation(%d) - CacheRead(%d) = %d",
 			inputTokens, cacheUsage.CacheCreationInputTokens, cacheUsage.CacheReadInputTokens, billedInput)
@@ -1712,9 +1720,17 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 			truncateForLog(finalContent), estimateApproxTokens(finalContent),
 			truncateForLog(rawThinkingContent), estimateApproxTokens(rawThinkingContent), len(toolUses))
 		logger.Infof("[TokenDebug][Claude][NonStream] 最终 outputTokens=%d (本地重新估算, 非上游值)", outputTokens)
-		logger.Infof("[TokenDebug][Claude][NonStream] Cache 计算结果: CacheRead=%d, CacheCreation=%d, 5m=%d, 1h=%d",
+		logger.Infof("[TokenDebug][Claude][NonStream] Cache 计算结果(缩放前): CacheRead=%d, CacheCreation=%d, 5m=%d, 1h=%d",
 			cacheUsage.CacheReadInputTokens, cacheUsage.CacheCreationInputTokens,
 			cacheUsage.CacheCreation5mInputTokens, cacheUsage.CacheCreation1hInputTokens)
+		// 按比例缩放 cache 值到真实 input 尺度
+		if cacheProfile != nil {
+			scaleCacheUsageToRealInput(&cacheUsage, cacheProfile.TotalInputTokens, inputTokens)
+			logger.Infof("[TokenDebug][Claude][NonStream] Cache 缩放: localTotalEstimate=%d, realInputTokens=%d, 缩放后 CacheRead=%d, CacheCreation=%d, 5m=%d, 1h=%d",
+				cacheProfile.TotalInputTokens, inputTokens,
+				cacheUsage.CacheReadInputTokens, cacheUsage.CacheCreationInputTokens,
+				cacheUsage.CacheCreation5mInputTokens, cacheUsage.CacheCreation1hInputTokens)
+		}
 		billedInput := billedClaudeInputTokens(inputTokens, cacheUsage)
 		logger.Infof("[TokenDebug][Claude][NonStream] 最终 billed input_tokens = inputTokens(%d) - CacheCreation(%d) - CacheRead(%d) = %d",
 			inputTokens, cacheUsage.CacheCreationInputTokens, cacheUsage.CacheReadInputTokens, billedInput)

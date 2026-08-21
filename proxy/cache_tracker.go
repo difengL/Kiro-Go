@@ -573,6 +573,35 @@ func billedClaudeInputTokens(inputTokens int, usage promptCacheUsage) int {
 	return maxInt(inputTokens-usage.CacheCreationInputTokens-usage.CacheReadInputTokens, 0)
 }
 
+// scaleCacheUsageToRealInput scales the locally-estimated cache values
+// proportionally to match the real input token count from upstream.
+//
+// The cache tracker computes values based on local token estimation
+// (estimatedInputTokens), but the actual input from Kiro (realInputTokens
+// via contextUsagePercentage) includes server-side injected content
+// (system prompt, tools, etc.) that the proxy cannot see.
+//
+// This function scales cache values so that:
+//   cacheValues / realInputTokens ≈ localCacheValues / localTotalEstimate
+//
+// This ensures the cache values are proportional to the real total input,
+// maintaining the semantic relationship:
+//   billed_input + cache_creation + cache_read = realInputTokens
+func scaleCacheUsageToRealInput(usage *promptCacheUsage, localTotalEstimate int, realInputTokens int) {
+	if usage == nil || localTotalEstimate <= 0 || realInputTokens <= 0 {
+		return
+	}
+	// No scaling needed if estimates are close enough (within 10%)
+	if realInputTokens <= localTotalEstimate*11/10 && realInputTokens >= localTotalEstimate*9/10 {
+		return
+	}
+	scale := float64(realInputTokens) / float64(localTotalEstimate)
+	usage.CacheCreationInputTokens = int(float64(usage.CacheCreationInputTokens) * scale)
+	usage.CacheReadInputTokens = int(float64(usage.CacheReadInputTokens) * scale)
+	usage.CacheCreation5mInputTokens = int(float64(usage.CacheCreation5mInputTokens) * scale)
+	usage.CacheCreation1hInputTokens = int(float64(usage.CacheCreation1hInputTokens) * scale)
+}
+
 func buildClaudeUsageMap(inputTokens, outputTokens int, usage promptCacheUsage, includeCache bool) map[string]interface{} {
 	result := map[string]interface{}{
 		"input_tokens":  billedClaudeInputTokens(inputTokens, usage),

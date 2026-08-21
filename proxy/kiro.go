@@ -215,6 +215,13 @@ type KiroHistoryMessage struct {
 type KiroAssistantResponseMessage struct {
 	Content  string        `json:"content"`
 	ToolUses []KiroToolUse `json:"toolUses,omitempty"`
+
+	// ContentFromThinking records that Content was backfilled from the turn's
+	// reasoning block because the turn carried no client-visible text. Internal
+	// only (never sent upstream): sanitizeKiroHistory needs the provenance to
+	// decide whether the text may survive, because reasoning text is first-person
+	// planning narration that only makes sense next to the tool call it planned.
+	ContentFromThinking bool `json:"-"`
 }
 
 type KiroToolUse struct {
@@ -232,16 +239,6 @@ type InferenceConfig struct {
 // ==================== Stream Callbacks ====================
 
 // KiroStreamCallback stream response callbacks
-type KiroTokenUsage struct {
-	InputTokens              int
-	OutputTokens             int
-	UncachedInputTokens      int
-	CacheReadInputTokens     int
-	CacheWriteInputTokens    int
-	CacheCreationInputTokens int
-	CacheFieldsPresent       bool
-}
-
 type KiroStreamCallback struct {
 	OnText         func(text string, isThinking bool)
 	OnToolUse      func(toolUse KiroToolUse)
@@ -249,7 +246,8 @@ type KiroStreamCallback struct {
 	OnError        func(err error)
 	OnCredits      func(credits float64)
 	OnContextUsage func(percentage float64)
-	OnTokenUsage   func(usage KiroTokenUsage)
+	// 排查措施5：流结束后检查是否因网络中断而截断。
+	StreamTruncated *bool
 }
 
 // ==================== API Call ====================
@@ -433,10 +431,23 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 	// Read directly without bufio to avoid buffering latency in streaming responses.
 	var inputTokens, outputTokens int
 	var totalCredits float64
-	var tokenUsage KiroTokenUsage
 	var currentToolUse *toolUseState
 	var lastAssistantContent string
 	var lastReasoningContent string
+
+	// Diagnostics for premature-stop investigation.
+	var eventCount, toolUseCount, textBytes, reasoningBytes int
+	var streamTruncated bool
+
+	// 排查措施2：记录最后两个事件类型和最后一个事件的 payload 摘要，
+	// 用来判断上游到底以什么事件结束流、有没有遗漏 stop_reason 信号。
+	var prevEventType string
+	var lastEventType string
+	var lastEventSummary string
+
+	// 上游 token 字段探针（临时排查）：不带字段名先验地记录事件流里的
+	// 全部数值字段，用来判断上游到底有没有回传 token 消耗数据。
+	probe := newTokenFieldProbe()
 
 	for {
 		// Prelude: 12 bytes (total_len + headers_len + crc)
@@ -446,6 +457,15 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 			break
 		}
 		if err != nil {
+			// Mid-stream read failure: the upstream cut us off. Surface it as a
+			// truncation rather than a clean end so a premature stop is visible.
+			// 排查措施5：修复 streamTruncated 死代码
+			streamTruncated = true
+			if callback.StreamTruncated != nil {
+				*callback.StreamTruncated = true
+			}
+			logger.Warnf("[KiroAPI] stream truncated reading prelude after events=%d toolUses=%d textBytes=%d: %v",
+				eventCount, toolUseCount, textBytes, err)
 			return err
 		}
 
@@ -461,6 +481,13 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 		msgBuf := make([]byte, remaining)
 		_, err = io.ReadFull(body, msgBuf)
 		if err != nil {
+			// 排查措施5：修复 streamTruncated 死代码
+			streamTruncated = true
+			if callback.StreamTruncated != nil {
+				*callback.StreamTruncated = true
+			}
+			logger.Warnf("[KiroAPI] stream truncated mid-message after events=%d toolUses=%d textBytes=%d: %v",
+				eventCount, toolUseCount, textBytes, err)
 			return err
 		}
 
@@ -479,13 +506,20 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 			continue
 		}
 
+		eventCount++
+		probe.observe(eventType, event, payloadBytes)
 		inputTokens, outputTokens = updateTokensFromEvent(event, inputTokens, outputTokens)
-		updateTokenUsageFromEvent(event, &tokenUsage)
+
+		// 排查措施2：记录事件序列，用于判断上游以什么事件结束。
+		prevEventType = lastEventType
+		lastEventType = eventType
+		lastEventSummary = summarizeEventPayload(eventType, payloadBytes)
 
 		// Dispatch by event type.
 		switch eventType {
 		case "assistantResponseEvent":
 			if content, ok := event["content"].(string); ok && content != "" {
+				textBytes += len(content)
 				normalized := normalizeChunk(content, &lastAssistantContent)
 				if normalized != "" && callback.OnText != nil {
 					callback.OnText(normalized, false)
@@ -493,12 +527,16 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 			}
 		case "reasoningContentEvent":
 			if text, ok := event["text"].(string); ok && text != "" {
+				reasoningBytes += len(text)
 				normalized := normalizeChunk(text, &lastReasoningContent)
 				if normalized != "" && callback.OnText != nil {
 					callback.OnText(normalized, true)
 				}
 			}
 		case "toolUseEvent":
+			if firstBoolField(event, "stop", "isStop", "done") {
+				toolUseCount++
+			}
 			currentToolUse = handleToolUseEvent(event, currentToolUse, callback)
 		case "meteringEvent":
 			if usage, ok := event["usage"].(float64); ok {
@@ -514,8 +552,17 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 	}
 
 	if currentToolUse != nil {
+		toolUseCount++
 		finishToolUse(currentToolUse, callback)
 	}
+
+	// Diagnostics for premature-stop investigation: when a long task halts
+	// early the upstream stream ends with no toolUse and little text, so log
+	// the shape of what actually arrived.
+	// 排查措施2：输出最后两个事件类型和最后一个事件的 payload 摘要。
+	logger.Infof("[KiroAPI] stream ended events=%d toolUses=%d textBytes=%d reasoningBytes=%d input=%d output=%d truncated=%t lastEvent=%s prevEvent=%s lastPayload=%s",
+		eventCount, toolUseCount, textBytes, reasoningBytes, inputTokens, outputTokens, streamTruncated,
+		lastEventType, prevEventType, lastEventSummary)
 
 	if callback.OnCredits != nil && totalCredits > 0 {
 		callback.OnCredits(totalCredits)
@@ -524,65 +571,11 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 	if callback.OnComplete != nil {
 		callback.OnComplete(inputTokens, outputTokens)
 	}
-	tokenUsage.InputTokens = inputTokens
-	tokenUsage.OutputTokens = outputTokens
 
-	if callback.OnTokenUsage != nil {
-		callback.OnTokenUsage(tokenUsage)
-	}
+	// 探针汇总放在最后，才能把"上游给了什么"和"现有解析认出了什么"并排打出来。
+	probe.report(probeTokenUsage{InputTokens: inputTokens, OutputTokens: outputTokens})
+
 	return nil
-}
-
-func updateTokenUsageFromEvent(event map[string]interface{}, result *KiroTokenUsage) {
-	if result == nil {
-		return
-	}
-	candidates := []map[string]interface{}{event}
-	collectUsageMaps(event, &candidates)
-	for _, usage := range candidates {
-		if usage == nil {
-			continue
-		}
-		if v, ok := readTokenNumber(usage, "inputTokens", "promptTokens", "totalInputTokens", "input_tokens", "prompt_tokens", "total_input_tokens"); ok {
-			result.InputTokens = v
-		}
-		if v, ok := readTokenNumber(usage, "outputTokens", "completionTokens", "totalOutputTokens", "output_tokens", "completion_tokens", "total_output_tokens"); ok {
-			result.OutputTokens = v
-		}
-		if v, ok := readTokenNumber(usage, "uncachedInputTokens", "uncached_input_tokens"); ok {
-			result.UncachedInputTokens = v
-		}
-		if v, ok := readTokenNumber(usage, "cacheReadInputTokens", "cache_read_input_tokens"); ok {
-			result.CacheReadInputTokens = v
-			result.CacheFieldsPresent = true
-		} else if hasTokenField(usage, "cacheReadInputTokens", "cache_read_input_tokens") {
-			result.CacheFieldsPresent = true
-		}
-		if v, ok := readTokenNumber(usage, "cacheWriteInputTokens", "cache_write_input_tokens"); ok {
-			result.CacheWriteInputTokens = v
-			result.CacheFieldsPresent = true
-		} else if hasTokenField(usage, "cacheWriteInputTokens", "cache_write_input_tokens") {
-			result.CacheFieldsPresent = true
-		}
-		if v, ok := readTokenNumber(usage, "cacheCreationInputTokens", "cache_creation_input_tokens"); ok {
-			result.CacheCreationInputTokens = v
-			result.CacheFieldsPresent = true
-		} else if hasTokenField(usage, "cacheCreationInputTokens", "cache_creation_input_tokens") {
-			result.CacheFieldsPresent = true
-		}
-		if hasTokenField(usage, "uncachedInputTokens", "uncached_input_tokens") {
-			result.CacheFieldsPresent = true
-		}
-	}
-}
-
-func hasTokenField(m map[string]interface{}, keys ...string) bool {
-	for _, key := range keys {
-		if _, ok := m[key]; ok {
-			return true
-		}
-	}
-	return false
 }
 
 func updateTokensFromEvent(event map[string]interface{}, currentInputTokens, currentOutputTokens int) (int, int) {
@@ -609,6 +602,7 @@ func updateTokensFromEvent(event map[string]interface{}, currentInputTokens, cur
 			"input_tokens", "prompt_tokens", "total_input_tokens",
 		); ok {
 			inputTokens = v
+			continue
 		}
 
 		uncached, _ := readTokenNumber(usage, "uncachedInputTokens", "uncached_input_tokens")
@@ -835,7 +829,14 @@ func finishToolUse(state *toolUseState, callback *KiroStreamCallback) {
 	}
 	var input map[string]interface{}
 	if state.InputBuffer.Len() > 0 {
-		json.Unmarshal([]byte(state.InputBuffer.String()), &input)
+		raw := state.InputBuffer.String()
+		if err := json.Unmarshal([]byte(raw), &input); err != nil {
+			// A truncated or malformed argument buffer means the tool call goes
+			// upstream with empty input, which the model usually answers by
+			// giving up on the step. Surface it instead of failing silently.
+			logger.Warnf("[KiroAPI] tool_use %s(%s) input JSON invalid, dropping %d bytes of arguments: %v",
+				state.Name, state.ToolUseID, len(raw), err)
+		}
 	}
 	if input == nil {
 		input = make(map[string]interface{})
@@ -863,6 +864,26 @@ func firstBoolField(m map[string]interface{}, keys ...string) bool {
 		}
 	}
 	return false
+}
+
+// summarizeEventPayload 生成事件 payload 的诊断摘要（排查措施2）。
+// 对携带正文的事件只记录类型和长度，避免把会话正文写进日志；
+// 对其他事件返回截断后的 JSON，用来发现是否有遗漏的结束信号。
+func summarizeEventPayload(eventType string, payload []byte) string {
+	const maxLen = 200
+	switch eventType {
+	case "assistantResponseEvent":
+		return fmt.Sprintf("%s(len=%d)", eventType, len(payload))
+	case "reasoningContentEvent":
+		return fmt.Sprintf("%s(len=%d)", eventType, len(payload))
+	case "toolUseEvent":
+		return fmt.Sprintf("%s(len=%d)", eventType, len(payload))
+	}
+	s := string(payload)
+	if len(s) > maxLen {
+		s = s[:maxLen] + "..."
+	}
+	return s
 }
 
 // extractEventType extracts the event type string from AWS Event Stream message headers.

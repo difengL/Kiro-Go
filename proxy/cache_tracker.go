@@ -125,97 +125,6 @@ func (t *promptCacheTracker) BuildClaudeProfile(req *ClaudeRequest, totalInputTo
 	}
 }
 
-// BuildOpenAIProfile builds a prompt-cache profile for GPT models using the
-// automated-prefix-caching model: OpenAI has no explicit cache_control
-// breakpoints, so every message boundary acts as an implicit breakpoint. A
-// conversation that re-sends an identical prefix (system prompt + tools +
-// earlier turns) hits the stored fingerprint and reports the matched prefix as
-// cached tokens.
-//
-// Both the Chat Completions and Responses flows normalize their request into an
-// *OpenAIRequest, so this builder is shared by both protocols.
-func (t *promptCacheTracker) BuildOpenAIProfile(req *OpenAIRequest, totalInputTokens int, perMsgTokens []int) *promptCacheProfile {
-	if req == nil || len(req.Messages) == 0 {
-		return nil
-	}
-
-	hasher := sha256.New()
-	breakpoints := make([]promptCacheBreakpoint, 0)
-	cumulativeTokens := 0
-
-	// Request-level prefix: model id and the tool definitions, which precede
-	// every message and therefore belong to the cacheable prefix.
-	preludeTokens := 0
-	canonicalPrelude := canonicalizeCacheValue(map[string]interface{}{
-		"kind":  "gpt_request_prelude",
-		"model": req.Model,
-	})
-	writeHashChunk(hasher, canonicalPrelude)
-	preludeTokens += bpeTokenCountGPT(canonicalPrelude)
-	if len(req.Tools) > 0 {
-		toolsValue := make([]interface{}, 0, len(req.Tools))
-		for _, tool := range req.Tools {
-			toolsValue = append(toolsValue, map[string]interface{}{
-				"type":        tool.Type,
-				"name":        tool.Function.Name,
-				"description": tool.Function.Description,
-				"parameters":  tool.Function.Parameters,
-			})
-		}
-		canonicalTools := canonicalizeCacheValue(map[string]interface{}{"kind": "gpt_tools", "tools": toolsValue})
-		writeHashChunk(hasher, canonicalTools)
-		preludeTokens += bpeTokenCountGPT(canonicalTools)
-	}
-	cumulativeTokens = preludeTokens
-
-	for i, msg := range req.Messages {
-		msgValue := map[string]interface{}{
-			"kind":          "gpt_message",
-			"message_index": i,
-			"role":          msg.Role,
-			"content":       msg.Content,
-		}
-		if len(msg.ToolCalls) > 0 {
-			msgValue["tool_calls"] = msg.ToolCalls
-		}
-		if msg.ToolCallID != "" {
-			msgValue["tool_call_id"] = msg.ToolCallID
-		}
-		canonical := canonicalizeCacheValue(stripCachePositionKeys(msgValue))
-		writeHashChunk(hasher, canonical)
-		// 断点 token 复用请求级估算结果（perMsgTokens），避免对输入做第二次
-		// BPE 编码；canonical 仅用于指纹哈希。调用方未提供时回退单条估算。
-		var msgTokens int
-		if i < len(perMsgTokens) && perMsgTokens[i] > 0 {
-			msgTokens = perMsgTokens[i]
-		} else {
-			msgTokens = bpeTokenCountGPT(canonical)
-		}
-		cumulativeTokens += msgTokens
-
-		var fingerprint [32]byte
-		copy(fingerprint[:], hasher.Sum(nil))
-		breakpoints = append(breakpoints, promptCacheBreakpoint{
-			Fingerprint:      fingerprint,
-			CumulativeTokens: cumulativeTokens,
-			TTL:              defaultPromptCacheTTL,
-		})
-	}
-
-	if len(breakpoints) == 0 {
-		return nil
-	}
-	if totalInputTokens < cumulativeTokens {
-		totalInputTokens = cumulativeTokens
-	}
-
-	return &promptCacheProfile{
-		Breakpoints:      breakpoints,
-		TotalInputTokens: totalInputTokens,
-		Model:            req.Model,
-	}
-}
-
 func (t *promptCacheTracker) Compute(accountID string, profile *promptCacheProfile) promptCacheUsage {
 	if t == nil || profile == nil || len(profile.Breakpoints) == 0 || accountID == "" {
 		return promptCacheUsage{}
@@ -348,7 +257,7 @@ func flattenClaudeCacheBlocks(req *ClaudeRequest) []cacheablePromptBlock {
 		fingerprintValue := stripCachePositionKeys(toolValue)
 		blocks = append(blocks, cacheablePromptBlock{
 			Value:  fingerprintValue,
-			Tokens: bpeTokenCountClaude(canonicalizeCacheValue(fingerprintValue)),
+			Tokens: estimateApproxTokens(canonicalizeCacheValue(fingerprintValue)),
 			TTL:    normalizePromptCacheTTL(extractPromptCacheTTL(tool)),
 		})
 	}
@@ -370,7 +279,7 @@ func buildCachePreludeBlock(req *ClaudeRequest) cacheablePromptBlock {
 	}
 	return cacheablePromptBlock{
 		Value:  prelude,
-		Tokens: bpeTokenCountClaude(canonicalizeCacheValue(prelude)),
+		Tokens: estimateApproxTokens(canonicalizeCacheValue(prelude)),
 	}
 }
 
@@ -460,7 +369,7 @@ func appendPromptBlock(blocks *[]cacheablePromptBlock, wrapper map[string]interf
 	canonical := canonicalizeCacheValue(fingerprintValue)
 	*blocks = append(*blocks, cacheablePromptBlock{
 		Value:        fingerprintValue,
-		Tokens:       bpeTokenCountClaude(canonical),
+		Tokens:       estimateApproxTokens(canonical),
 		TTL:          ttl,
 		IsMessageEnd: isMessageEnd,
 	})
@@ -597,13 +506,13 @@ func computePromptCacheTTLBreakdown(profile *promptCacheProfile, matchedTokens i
 	return cache5m, cache1h
 }
 
-// buildClaudeUsageMap emits usage in the official Anthropic shape:
-// input_tokens is the FULL input count (including cache hits) and cache reads
-// are reported separately — clients rely on input_tokens to judge context
-// occupancy / when to compact, so it must not be discounted.
+func billedClaudeInputTokens(inputTokens int, usage promptCacheUsage) int {
+	return maxInt(inputTokens-usage.CacheCreationInputTokens-usage.CacheReadInputTokens, 0)
+}
+
 func buildClaudeUsageMap(inputTokens, outputTokens int, usage promptCacheUsage, includeCache bool) map[string]interface{} {
 	result := map[string]interface{}{
-		"input_tokens":  inputTokens,
+		"input_tokens":  billedClaudeInputTokens(inputTokens, usage),
 		"output_tokens": outputTokens,
 	}
 	if !includeCache {

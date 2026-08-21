@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"kiro-go/config"
+	"kiro-go/logger"
 	"net/http"
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
@@ -45,6 +47,17 @@ const ThinkingModePrompt = `<thinking_mode>enabled</thinking_mode>
 
 const minimalFallbackUserContent = "."
 const toolResultsContinuationPrefix = "Tool results:"
+
+// maxToolResultContinuationBytes bounds the flattened tool-result text folded
+// into a user turn. Oversized output is elided in the middle (see elideMiddle)
+// rather than cut at the head, so the trailing summary or error survives.
+const maxToolResultContinuationBytes = 4000
+
+// toolResultElisionMarker replaces the removed middle of oversized tool output.
+// It states the omission explicitly so the model treats the gap as truncation
+// rather than as the actual end of the output.
+const toolResultElisionMarker = "\n\n[... %d bytes of tool output omitted ...]\n\n"
+
 const toolResultImagePlaceholder = "[Tool returned an image; the image is attached to this message.]"
 
 // maxPayloadBytes is the upper bound for the serialized Kiro request body.
@@ -250,11 +263,12 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 				})
 			}
 		} else if msg.Role == "assistant" {
-			content, toolUses := extractClaudeAssistantContent(msg.Content)
+			content, toolUses, fromThinking := extractClaudeAssistantContent(msg.Content)
 			history = append(history, KiroHistoryMessage{
 				AssistantResponseMessage: &KiroAssistantResponseMessage{
-					Content:  content,
-					ToolUses: toolUses,
+					Content:             content,
+					ToolUses:            toolUses,
+					ContentFromThinking: fromThinking,
 				},
 			})
 		}
@@ -348,6 +362,16 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 			Temperature: req.Temperature,
 			TopP:        req.TopP,
 		}
+	}
+
+	// 排查措施1：记录客户端发送的 maxTokens，确认是否透传给上游。
+	if payload.InferenceConfig != nil && payload.InferenceConfig.MaxTokens > 0 {
+		logger.Infof("[KiroPayload] maxTokens=%d temperature=%v topP=%v",
+			payload.InferenceConfig.MaxTokens,
+			payload.InferenceConfig.Temperature,
+			payload.InferenceConfig.TopP)
+	} else {
+		logger.Infof("[KiroPayload] InferenceConfig 未设置或 maxTokens=0，使用上游默认值")
 	}
 
 	truncatePayloadToLimit(payload, systemPrompt != "")
@@ -683,10 +707,17 @@ func extractClaudeUserContent(content interface{}) (string, []KiroImage, []KiroT
 						resultContent = toolResultImagePlaceholder
 					}
 				}
+				// Propagate the failure flag: reporting a failed tool call as
+				// "success" makes the upstream model treat the step as done and
+				// end the turn instead of retrying or recovering.
+				status := "success"
+				if isErr, ok := block["is_error"].(bool); ok && isErr {
+					status = "error"
+				}
 				toolResults = append(toolResults, KiroToolResult{
 					ToolUseID: toolUseID,
 					Content:   []KiroResultContent{{Text: resultContent}},
-					Status:    "success",
+					Status:    status,
 				})
 			}
 		}
@@ -766,12 +797,18 @@ func extractToolResultContent(content interface{}) (string, []KiroImage) {
 	return "", nil
 }
 
-func extractClaudeAssistantContent(content interface{}) (string, []KiroToolUse) {
+// extractClaudeAssistantContent splits a Claude assistant turn into its body
+// text and structured tool calls. The third result reports that the body came
+// from the turn's reasoning block rather than from client-visible text; callers
+// must keep that provenance, since reasoning text is only safe to show while the
+// tool call it narrates is still attached.
+func extractClaudeAssistantContent(content interface{}) (string, []KiroToolUse, bool) {
 	var text string
+	var thinking string
 	var toolUses []KiroToolUse
 
 	if s, ok := content.(string); ok {
-		return s, nil
+		return s, nil, false
 	}
 
 	if blocks, ok := content.([]interface{}); ok {
@@ -786,6 +823,13 @@ func extractClaudeAssistantContent(content interface{}) (string, []KiroToolUse) 
 			case "text":
 				if t, ok := block["text"].(string); ok {
 					text += t
+				}
+			case "thinking":
+				// Kept only as a fallback body for turns whose visible text is
+				// empty (thinking + tool_use is a common Claude Code shape).
+				// Such a turn would otherwise look hollow and break alternation.
+				if t, ok := block["thinking"].(string); ok {
+					thinking += t
 				}
 			case "tool_use":
 				id, _ := block["id"].(string)
@@ -803,7 +847,16 @@ func extractClaudeAssistantContent(content interface{}) (string, []KiroToolUse) 
 		}
 	}
 
-	return text, toolUses
+	// Fall back to the reasoning text when the turn carries no visible text, so
+	// the assistant turn keeps a real body instead of becoming a hollow turn.
+	// Report the substitution: reasoning is first-person planning prose ("Now I
+	// need to update the comment... Let me check the test file"), which reads as
+	// a finished reply once the tool call it introduces is stripped away.
+	if strings.TrimSpace(text) == "" && strings.TrimSpace(thinking) != "" {
+		return thinking, toolUses, true
+	}
+
+	return text, toolUses, false
 }
 
 func convertClaudeTools(tools []ClaudeTool) ([]KiroToolWrapper, map[string]string) {
@@ -1106,16 +1159,9 @@ type OpenAIChoice struct {
 }
 
 type OpenAIUsage struct {
-	PromptTokens         int                    `json:"prompt_tokens"`
-	CompletionTokens     int                    `json:"completion_tokens"`
-	TotalTokens          int                    `json:"total_tokens"`
-	PromptTokensDetails  *OpenAIPromptTokenDetails `json:"prompt_tokens_details,omitempty"`
-}
-
-// OpenAIPromptTokenDetails carries the simulated prompt-cache hit count under
-// the official OpenAI field name prompt_tokens_details.cached_tokens.
-type OpenAIPromptTokenDetails struct {
-	CachedTokens int `json:"cached_tokens"`
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
 }
 
 // ==================== OpenAI -> Kiro 转换 ====================
@@ -1442,19 +1488,41 @@ func currentToolResultsMatchLastAssistant(history []KiroHistoryMessage, currentT
 	return true
 }
 
-// pollutedToolCallTextPattern matches the legacy "[Called tool X with input ...]"
-// / "[Called tool X]" narration that an earlier version of this proxy wrote into
-// assistant turns. Models trained on that in-context text began emitting it as
-// output instead of issuing real tool calls; clients then stored that output as
-// assistant history and replay it, re-seeding the pollution. We strip it from
-// assistant content on the way back upstream so the pattern is not reinforced
-// and the model can recover within an ongoing session.
-var pollutedToolCallTextPattern = regexp.MustCompile(`\[Called tool [^\]]*\]`)
+// pollutedToolCallTextPattern matches every stand-in for a tool call that some
+// earlier version of this proxy wrote into assistant turns:
+//
+//	[Called tool X with input {...}]  /  [Called tool X]
+//	(assistant issued a tool call; the result appears in the following message)
+//	(assistant issued a tool call)
+//
+// Each of them poisons the context the same way. Repeated once per assistant
+// turn down a long tool loop, the text stops reading as a note about a call and
+// becomes the shape an assistant turn is supposed to have, so the model emits it
+// verbatim as its whole reply and stops with no call. Deleting the code that
+// writes it is not enough: the client already saved those replies in its session
+// file and replays them as assistant history every round, re-seeding the
+// pollution from outside this process. Measured — after the synthesizer was
+// removed, a request still came back textBytes=75 / text_len=75 stop=end_turn,
+// exactly the 75 bytes of the longer form. So we scrub the patterns off inbound
+// assistant content too, which lets a session that is already polluted recover.
+var pollutedToolCallTextPattern = regexp.MustCompile(
+	`\[Called tool [^\]]*\]|\(assistant issued a tool call(?:; the result appears in the following message)?\)`,
+)
 
-// stripPollutedToolCallText removes legacy tool-call narration from text and
+// pollutedToolCallTextMarkers are the cheap substring probes that gate the regex.
+var pollutedToolCallTextMarkers = []string{"[Called tool ", "(assistant issued a tool call"}
+
+// stripPollutedToolCallText removes tool-call stand-in narration from text and
 // tidies up the leftover whitespace.
 func stripPollutedToolCallText(content string) string {
-	if !strings.Contains(content, "[Called tool ") {
+	found := false
+	for _, marker := range pollutedToolCallTextMarkers {
+		if strings.Contains(content, marker) {
+			found = true
+			break
+		}
+	}
+	if !found {
 		return content
 	}
 	cleaned := pollutedToolCallTextPattern.ReplaceAllString(content, "")
@@ -1566,12 +1634,38 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 	for i := range history {
 		msg := &history[i]
 
-		if msg.AssistantResponseMessage != nil {
+		if a := msg.AssistantResponseMessage; a != nil {
 			// Scrub legacy tool-call narration that a polluted client may be
 			// replaying as assistant text, so we neither reinforce the pattern
 			// nor leave it for the model to imitate.
-			if msg.AssistantResponseMessage.Content != "" {
-				msg.AssistantResponseMessage.Content = stripPollutedToolCallText(msg.AssistantResponseMessage.Content)
+			if a.Content != "" {
+				a.Content = stripPollutedToolCallText(a.Content)
+			}
+
+			// A body backfilled from reasoning is only coherent while the tool call
+			// it narrates is still attached. Reasoning text is first-person planning
+			// prose — "Now I need to update the comment... Let me check the test
+			// file" — and the call is what makes it a preamble rather than a reply.
+			// Once the call is gone, the same words read as a complete assistant turn
+			// that announces an intention and stops. Repeated down a long tool loop,
+			// that becomes what the model believes an assistant turn IS, so it answers
+			// "继续执行" with a paragraph of plans, no tool call, and stop=end_turn.
+			//
+			// Measured, not hypothesized: msgs=76 history=50 curLen=12 came back as
+			// text_len=362 thinking_len=0 — the reply was pure planning narration and
+			// the model never entered the reasoning channel at all, because in-context
+			// the plan *was* the shape of an answer.
+			//
+			// Only the active tool turn keeps its reasoning, because there the call is
+			// still present and the narration is honestly a preamble. Everywhere else
+			// the borrowed text goes out with the call: the turn empties, the second
+			// pass removes it, and the neighbouring user turns merge so alternation
+			// survives without inventing assistant speech. This also covers turns that
+			// arrive with reasoning and no call at all, where the narration is orphaned
+			// from the start.
+			if a.ContentFromThinking && i != activeIdx {
+				a.Content = ""
+				a.ContentFromThinking = false
 			}
 		}
 
@@ -1579,13 +1673,26 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 			if i == activeIdx {
 				continue // keep the active tool turn structured
 			}
-			// Drop the structured tool calls WITHOUT writing any tool-invocation
-			// text into the assistant turn. Narrating the call here (e.g.
-			// "[Called tool X ...]") would give the model dozens of in-context
-			// examples of "invoke a tool by emitting this text", which it then
-			// imitates instead of issuing real structured tool calls. The tool's
-			// identity is preserved on the result side (user turn) via toolNames.
+
+			// Drop the structured tool calls WITHOUT reproducing any invocation
+			// syntax in the assistant turn. Narrating the call verbatim (e.g.
+			// "[Called tool X with {...}]") would give the model dozens of
+			// in-context examples of "invoke a tool by emitting this text", which
+			// it then imitates instead of issuing real structured tool calls. The
+			// tool's identity is preserved on the result side (user turn) via
+			// toolNames.
 			msg.AssistantResponseMessage.ToolUses = nil
+
+			// Do NOT synthesize replacement text here. Any fixed sentence written
+			// into assistant turns repeats once per turn across the whole history,
+			// and the model reads that repetition as the shape a turn is supposed
+			// to have: it emits the sentence verbatim as its entire reply and
+			// stops. Measured, not hypothesized — a 75-byte placeholder came back
+			// as textBytes=75 / text_len=75 with stop=end_turn and no tool call.
+			// A turn left empty here is dropped in the second pass, which merges
+			// the neighbouring user turns so alternation survives without
+			// inventing assistant speech. The call itself stays visible on the
+			// result side, where narrateToolResults names the tool.
 		}
 
 		if msg.UserInputMessage != nil && msg.UserInputMessage.UserInputMessageContext != nil {
@@ -1612,35 +1719,51 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 		}
 	}
 
-	// Second pass: drop assistant turns that carry no real content — either left
-	// empty by scrubbing, or consisting solely of the "." placeholder that an
-	// earlier version emitted (and that a polluted client now replays). Their
-	// tool activity already survives as narrated text in the adjacent user
-	// "Tool results" turn, so removing the hollow assistant turn loses no
-	// information and avoids seeding mimicable empty/"." turns.
+	// Second pass: drop assistant turns that carry no real content — either
+	// emptied by scrubbing, or consisting solely of the "." placeholder an
+	// earlier version emitted (and that a polluted client now replays) — then
+	// repair the alternation their removal would otherwise break.
+	//
+	// Two failure modes bound what this pass may do. Emitting such turns as-is
+	// teaches the model to reply with nothing, and so does substituting any fixed
+	// sentence for them: repeated once per turn down the history, the sentence
+	// becomes the shape the model believes a turn should have, and it replies with
+	// that sentence and nothing else. Leaving the gap is no better, because the
+	// neighbouring user turns then fuse into a run of consecutive user turns,
+	// which reads as "the assistant speaks once and the user just keeps going".
+	//
+	// So the gap is closed by merging the neighbours instead of filling it. Text
+	// merged into a user turn cannot become an example of what the model itself
+	// should emit, which is exactly the property a synthesized assistant turn
+	// lacks. The tool call stays visible on the result side, where
+	// narrateToolResults names the tool that produced each output.
 	cleaned := history[:0:0]
 	for i := range history {
 		msg := history[i]
-		if msg.AssistantResponseMessage != nil && len(msg.AssistantResponseMessage.ToolUses) == 0 {
-			c := strings.TrimSpace(msg.AssistantResponseMessage.Content)
-			if c == "" || c == minimalFallbackUserContent {
-				continue // drop hollow assistant turn
+
+		if a := msg.AssistantResponseMessage; a != nil && len(a.ToolUses) == 0 {
+			if c := strings.TrimSpace(a.Content); c == "" || c == minimalFallbackUserContent {
+				continue
 			}
 		}
-		// Collapse runs of consecutive identical user "Tool results" turns. A
-		// client stuck in a retry loop (e.g. the same tool error 100+ times)
-		// sends many identical tool results; once the hollow assistant turns
-		// between them are dropped they become adjacent duplicates that waste
-		// context and form a repetitive pattern. Keep one copy of each run.
-		if msg.UserInputMessage != nil && len(cleaned) > 0 {
-			last := cleaned[len(cleaned)-1]
-			if last.UserInputMessage != nil &&
-				strings.TrimSpace(last.UserInputMessage.Content) == strings.TrimSpace(msg.UserInputMessage.Content) &&
-				strings.TrimSpace(msg.UserInputMessage.Content) != "" &&
-				len(msg.UserInputMessage.Images) == 0 {
-				continue // skip duplicate consecutive user turn
+
+		if cur := msg.UserInputMessage; cur != nil && len(cleaned) > 0 {
+			if prev := cleaned[len(cleaned)-1].UserInputMessage; prev != nil {
+				// Collapse identical neighbours rather than merging them: a client
+				// stuck retrying one failing tool call sends the same result over
+				// and over, which wastes context and forms a repetitive pattern
+				// the model imitates. Keep one copy of each run.
+				text := strings.TrimSpace(cur.Content)
+				if text != "" && text == strings.TrimSpace(prev.Content) &&
+					len(cur.Images) == 0 && len(prev.Images) == 0 {
+					continue
+				}
+				prev.Content = joinHistoryText(prev.Content, cur.Content)
+				prev.Images = append(prev.Images, cur.Images...)
+				continue
 			}
 		}
+
 		cleaned = append(cleaned, msg)
 	}
 
@@ -1802,10 +1925,52 @@ func buildToolResultsContinuation(toolResults []KiroToolResult) string {
 	}
 
 	joined := toolResultsContinuationPrefix + "\n\n" + strings.Join(parts, "\n\n")
-	if len(joined) > 4000 {
-		return joined[:4000]
+	return elideMiddle(joined, maxToolResultContinuationBytes)
+}
+
+// elideMiddle shortens s to at most limit bytes by keeping its head and tail and
+// replacing the middle with a marker. Tool output carries its most useful signal
+// at both ends — the command and first results at the head, the summary, error,
+// or exit status at the tail — so a plain head-only cut silently discards the
+// conclusion. Cut points are moved back to rune boundaries so the result is
+// never invalid UTF-8 (which would break JSON encoding of the payload).
+func elideMiddle(s string, limit int) string {
+	if limit <= 0 || len(s) <= limit {
+		return s
 	}
-	return joined
+
+	marker := fmt.Sprintf(toolResultElisionMarker, len(s)-limit)
+	if len(marker) >= limit {
+		return truncateAtRuneBoundary(s, limit)
+	}
+
+	budget := limit - len(marker)
+	headBudget := budget * 2 / 3 // favor the head: it anchors what produced the output
+	tailBudget := budget - headBudget
+
+	head := truncateAtRuneBoundary(s, headBudget)
+	tail := trimToRuneBoundary(s[len(s)-tailBudget:])
+	return head + marker + tail
+}
+
+// truncateAtRuneBoundary cuts s to at most n bytes without splitting a rune.
+func truncateAtRuneBoundary(s string, n int) string {
+	if n >= len(s) {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
+}
+
+// trimToRuneBoundary drops leading bytes that are a rune continuation, so a
+// suffix taken at an arbitrary byte offset starts on a valid rune.
+func trimToRuneBoundary(s string) string {
+	for len(s) > 0 && !utf8.RuneStart(s[0]) {
+		s = s[1:]
+	}
+	return s
 }
 
 func trimLeadingAssistantHistory(history []KiroHistoryMessage) []KiroHistoryMessage {
@@ -2264,7 +2429,7 @@ func extractThinkingFromContent(content string) (string, string) {
 }
 
 // KiroToOpenAIResponseWithReasoning 带 reasoning_content 的 OpenAI 响应
-func KiroToOpenAIResponseWithReasoning(content, reasoningContent string, toolUses []KiroToolUse, inputTokens, outputTokens int, model, thinkingFormat string, cachedTokens int) map[string]interface{} {
+func KiroToOpenAIResponseWithReasoning(content, reasoningContent string, toolUses []KiroToolUse, inputTokens, outputTokens int, model, thinkingFormat string) map[string]interface{} {
 	finishReason := "stop"
 
 	message := map[string]interface{}{
@@ -2314,21 +2479,10 @@ func KiroToOpenAIResponseWithReasoning(content, reasoningContent string, toolUse
 			"message":       message,
 			"finish_reason": finishReason,
 		}},
-		"usage": buildOpenAIUsageMap(inputTokens, outputTokens, cachedTokens),
+		"usage": map[string]int{
+			"prompt_tokens":     inputTokens,
+			"completion_tokens": outputTokens,
+			"total_tokens":      inputTokens + outputTokens,
+		},
 	}
-}
-
-// buildOpenAIUsageMap emits usage in the official OpenAI shape: prompt_tokens
-// is the FULL input count (including cache hits) and the hit portion is
-// reported separately under prompt_tokens_details.cached_tokens.
-func buildOpenAIUsageMap(inputTokens, outputTokens, cachedTokens int) map[string]interface{} {
-	usage := map[string]interface{}{
-		"prompt_tokens":     inputTokens,
-		"completion_tokens": outputTokens,
-		"total_tokens":      inputTokens + outputTokens,
-	}
-	if cachedTokens > 0 {
-		usage["prompt_tokens_details"] = map[string]int{"cached_tokens": cachedTokens}
-	}
-	return usage
 }

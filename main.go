@@ -38,16 +38,6 @@ func main() {
 		log.Fatalf("Failed to create data directory: %v", err)
 	}
 
-	// BPE tokenizer 词表缓存目录：首次使用 tiktoken-go 时下载，之后离线可用。
-	// 用户可显式设置 TIKTOKEN_CACHE_DIR 覆盖。
-	if os.Getenv("TIKTOKEN_CACHE_DIR") == "" {
-		bpeCacheDir := filepath.Join(filepath.Dir(configPath), "bpe")
-		if err := os.MkdirAll(bpeCacheDir, 0755); err != nil {
-			log.Fatalf("Failed to create BPE cache directory: %v", err)
-		}
-		os.Setenv("TIKTOKEN_CACHE_DIR", bpeCacheDir)
-	}
-
 	// 加载配置
 	if err := config.Init(configPath); err != nil {
 		log.Fatalf("Failed to load config: %v", err)

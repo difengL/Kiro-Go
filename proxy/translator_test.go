@@ -654,7 +654,7 @@ func TestOpenAIToolResultImageCarriedWhenFollowedByUser(t *testing.T) {
 
 func TestResolveClaudeConversationID_Deterministic(t *testing.T) {
 	req := &ClaudeRequest{
-		Model: "claude-sonnet-4",
+		Model:  "claude-sonnet-4",
 		System: "You are a helpful assistant.",
 		Messages: []ClaudeMessage{
 			{Role: "user", Content: "Hello, what is 1+1?"},
@@ -669,7 +669,7 @@ func TestResolveClaudeConversationID_Deterministic(t *testing.T) {
 	}
 	// 第二次请求：历史更长但首条 user message 不变
 	req2 := &ClaudeRequest{
-		Model: "claude-sonnet-4",
+		Model:  "claude-sonnet-4",
 		System: "You are a helpful assistant.",
 		Messages: []ClaudeMessage{
 			{Role: "user", Content: "Hello, what is 1+1?"},
@@ -701,8 +701,8 @@ func TestResolveClaudeConversationID_SyntheticAnchorEmpty(t *testing.T) {
 
 func TestResolveClaudeConversationID_NoAnchorEmpty(t *testing.T) {
 	req := &ClaudeRequest{
-		Model:    "claude-sonnet-4",
-		Messages: []ClaudeMessage{{Role: "assistant", Content: "hi"}},
+		Model:     "claude-sonnet-4",
+		Messages:  []ClaudeMessage{{Role: "assistant", Content: "hi"}},
 		MaxTokens: 100,
 	}
 	if id := ResolveClaudeConversationID(nil, req); id != "" {
@@ -967,3 +967,75 @@ func TestResolveClaudeConversationID_SystemAnchorUsesFirstBlockOnly(t *testing.T
 	}
 }
 
+// TestClaudeToolResultErrorStatus verifies a failed tool_result is forwarded
+// upstream with status "error". Reporting a failure as "success" makes the
+// upstream model believe the step succeeded, so it stops instead of retrying or
+// working around the failure — one cause of long tasks halting mid-way.
+func TestClaudeToolResultErrorStatus(t *testing.T) {
+	req := &ClaudeRequest{
+		Model: "claude-sonnet-4.6",
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: "read the config"},
+			{Role: "assistant", Content: []interface{}{
+				map[string]interface{}{
+					"type":  "tool_use",
+					"id":    "toolu_1",
+					"name":  "Read",
+					"input": map[string]interface{}{"path": "/nope"},
+				},
+			}},
+			{Role: "user", Content: []interface{}{
+				map[string]interface{}{
+					"type":        "tool_result",
+					"tool_use_id": "toolu_1",
+					"content":     "ENOENT: no such file",
+					"is_error":    true,
+				},
+			}},
+		},
+	}
+
+	payload := ClaudeToKiro(req, false)
+	cur := payload.ConversationState.CurrentMessage.UserInputMessage
+	if cur.UserInputMessageContext == nil || len(cur.UserInputMessageContext.ToolResults) != 1 {
+		t.Fatalf("expected 1 tool result on current message, got %+v", cur.UserInputMessageContext)
+	}
+	if got := cur.UserInputMessageContext.ToolResults[0].Status; got != "error" {
+		t.Fatalf("expected status \"error\" for failed tool_result, got %q", got)
+	}
+}
+
+// TestClaudeToolResultSuccessStatus guards the default: without is_error the
+// status must stay "success".
+func TestClaudeToolResultSuccessStatus(t *testing.T) {
+	req := &ClaudeRequest{
+		Model: "claude-sonnet-4.6",
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: "read the config"},
+			{Role: "assistant", Content: []interface{}{
+				map[string]interface{}{
+					"type":  "tool_use",
+					"id":    "toolu_1",
+					"name":  "Read",
+					"input": map[string]interface{}{"path": "/ok"},
+				},
+			}},
+			{Role: "user", Content: []interface{}{
+				map[string]interface{}{
+					"type":        "tool_result",
+					"tool_use_id": "toolu_1",
+					"content":     "file contents here",
+				},
+			}},
+		},
+	}
+
+	payload := ClaudeToKiro(req, false)
+	cur := payload.ConversationState.CurrentMessage.UserInputMessage
+	if cur.UserInputMessageContext == nil || len(cur.UserInputMessageContext.ToolResults) != 1 {
+		t.Fatalf("expected 1 tool result, got %+v", cur.UserInputMessageContext)
+	}
+	if got := cur.UserInputMessageContext.ToolResults[0].Status; got != "success" {
+		t.Fatalf("expected status \"success\", got %q", got)
+	}
+}

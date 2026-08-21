@@ -5,9 +5,6 @@ import (
 	"math"
 )
 
-// estimateApproxTokens is the character-based fallback estimator. It remains
-// only as the degradation path when the real BPE tokenizer is unavailable; all
-// request-path token counts now go through bpeTokenCount*.
 func estimateApproxTokens(text string) int {
 	if text == "" {
 		return 0
@@ -49,8 +46,6 @@ func estimateApproxTokens(text string) int {
 	return estimated
 }
 
-// ==================== Claude 侧（cl100k_base） ====================
-
 func estimateClaudeRequestInputTokens(req *ClaudeRequest) int {
 	if req == nil {
 		return 0
@@ -63,21 +58,21 @@ func estimateClaudeRequestInputTokens(req *ClaudeRequest) int {
 	}
 
 	for _, tool := range req.Tools {
-		total += bpeTokenCountClaude(tool.Name)
-		total += bpeTokenCountClaude(tool.Description)
-		total += estimateJSONTokensClaude(tool.InputSchema)
+		total += estimateApproxTokens(tool.Name)
+		total += estimateApproxTokens(tool.Description)
+		total += estimateJSONTokens(tool.InputSchema)
 	}
 
 	return total
 }
 
 func estimateClaudeOutputTokens(content, thinkingContent string, toolUses []KiroToolUse) int {
-	total := bpeTokenCountClaude(content)
-	total += bpeTokenCountClaude(thinkingContent)
+	total := estimateApproxTokens(content)
+	total += estimateApproxTokens(thinkingContent)
 
 	for _, tu := range toolUses {
-		total += bpeTokenCountClaude(tu.Name)
-		total += estimateJSONTokensClaude(tu.Input)
+		total += estimateApproxTokens(tu.Name)
+		total += estimateJSONTokens(tu.Input)
 	}
 
 	return total
@@ -88,7 +83,7 @@ func estimateClaudeValueTokens(v interface{}) int {
 	case nil:
 		return 0
 	case string:
-		return bpeTokenCountClaude(value)
+		return estimateApproxTokens(value)
 	case []interface{}:
 		total := 0
 		for _, part := range value {
@@ -100,19 +95,19 @@ func estimateClaudeValueTokens(v interface{}) int {
 		switch typeName {
 		case "text":
 			if text, ok := value["text"].(string); ok {
-				return bpeTokenCountClaude(text)
+				return estimateApproxTokens(text)
 			}
 		case "thinking":
 			if thinking, ok := value["thinking"].(string); ok {
-				return bpeTokenCountClaude(thinking)
+				return estimateApproxTokens(thinking)
 			}
 		case "tool_use":
 			total := 0
 			if name, ok := value["name"].(string); ok {
-				total += bpeTokenCountClaude(name)
+				total += estimateApproxTokens(name)
 			}
 			if input, ok := value["input"]; ok {
-				total += estimateJSONTokensClaude(input)
+				total += estimateJSONTokens(input)
 			}
 			if total > 0 {
 				return total
@@ -125,10 +120,10 @@ func estimateClaudeValueTokens(v interface{}) int {
 
 		total := 0
 		if text, ok := value["text"].(string); ok {
-			total += bpeTokenCountClaude(text)
+			total += estimateApproxTokens(text)
 		}
 		if thinking, ok := value["thinking"].(string); ok {
-			total += bpeTokenCountClaude(thinking)
+			total += estimateApproxTokens(thinking)
 		}
 		if content, ok := value["content"]; ok {
 			total += estimateClaudeValueTokens(content)
@@ -137,54 +132,47 @@ func estimateClaudeValueTokens(v interface{}) int {
 			return total
 		}
 
-		return estimateJSONTokensClaude(value)
+		return estimateJSONTokens(value)
 	default:
-		return estimateJSONTokensClaude(value)
+		return estimateJSONTokens(value)
 	}
 }
 
-// ==================== OpenAI 侧（o200k_base） ====================
+func estimateJSONTokens(v interface{}) int {
+	if v == nil {
+		return 0
+	}
+
+	b, err := json.Marshal(v)
+	if err != nil {
+		return 0
+	}
+
+	return estimateApproxTokens(string(b))
+}
 
 func estimateOpenAIRequestInputTokens(req *OpenAIRequest) int {
-	total, _ := estimateOpenAIRequestInputTokensDetailed(req)
-	return total
-}
-
-// estimateOpenAIRequestInputTokensDetailed is the single-encode entry point for
-// GPT requests: it BPE-encodes each message exactly once and returns both the
-// grand total and the per-message counts. The cache profile builder reuses the
-// per-message counts instead of encoding the input a second time.
-func estimateOpenAIRequestInputTokensDetailed(req *OpenAIRequest) (total int, perMsg []int) {
 	if req == nil {
-		return 0, nil
+		return 0
 	}
 
-	perMsg = make([]int, len(req.Messages))
-	for i, msg := range req.Messages {
-		n := estimateOpenAIMessageTokens(msg)
-		perMsg[i] = n
-		total += n
+	total := 0
+
+	for _, msg := range req.Messages {
+		total += estimateOpenAIContentTokens(msg.Content)
+		total += estimateApproxTokens(msg.ToolCallID)
+		for _, tc := range msg.ToolCalls {
+			total += estimateApproxTokens(tc.Function.Name)
+			total += estimateApproxTokens(tc.Function.Arguments)
+		}
 	}
 
 	for _, tool := range req.Tools {
-		total += bpeTokenCountGPT(tool.Function.Name)
-		total += bpeTokenCountGPT(tool.Function.Description)
-		total += estimateJSONTokensGPT(tool.Function.Parameters)
+		total += estimateApproxTokens(tool.Function.Name)
+		total += estimateApproxTokens(tool.Function.Description)
+		total += estimateJSONTokens(tool.Function.Parameters)
 	}
 
-	return total, perMsg
-}
-
-// estimateOpenAIMessageTokens counts a single OpenAI message (content + tool
-// calls + tool_call_id). Shared by the request-level estimator and the cache
-// profile builder so a request's input text is BPE-encoded exactly once.
-func estimateOpenAIMessageTokens(msg OpenAIMessage) int {
-	total := estimateOpenAIContentTokens(msg.Content)
-	total += bpeTokenCountGPT(msg.ToolCallID)
-	for _, tc := range msg.ToolCalls {
-		total += bpeTokenCountGPT(tc.Function.Name)
-		total += bpeTokenCountGPT(tc.Function.Arguments)
-	}
 	return total
 }
 
@@ -193,52 +181,16 @@ func estimateOpenAIContentTokens(content interface{}) int {
 	case nil:
 		return 0
 	case string:
-		return bpeTokenCountGPT(value)
+		return estimateApproxTokens(value)
 	default:
 		text := extractOpenAIMessageText(value)
 		if text != "" {
-			return bpeTokenCountGPT(text)
+			return estimateApproxTokens(text)
 		}
-		return estimateJSONTokensGPT(value)
+		return estimateJSONTokens(value)
 	}
 }
 
 func estimateOpenAIOutputTokens(content, reasoningContent string, toolUses []KiroToolUse) int {
-	total := bpeTokenCountGPT(content)
-	total += bpeTokenCountGPT(reasoningContent)
-
-	for _, tu := range toolUses {
-		total += bpeTokenCountGPT(tu.Name)
-		total += estimateJSONTokensGPT(tu.Input)
-	}
-
-	return total
-}
-
-// ==================== JSON 计数（真实 BPE，按协议选编码） ====================
-
-func estimateJSONTokensClaude(v interface{}) int {
-	if v == nil {
-		return 0
-	}
-
-	b, err := json.Marshal(v)
-	if err != nil {
-		return 0
-	}
-
-	return bpeTokenCountClaude(string(b))
-}
-
-func estimateJSONTokensGPT(v interface{}) int {
-	if v == nil {
-		return 0
-	}
-
-	b, err := json.Marshal(v)
-	if err != nil {
-		return 0
-	}
-
-	return bpeTokenCountGPT(string(b))
+	return estimateClaudeOutputTokens(content, reasoningContent, toolUses)
 }

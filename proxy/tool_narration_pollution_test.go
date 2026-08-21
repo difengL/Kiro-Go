@@ -142,6 +142,53 @@ func TestDropsDotPollutedAssistantTurns(t *testing.T) {
 	}
 }
 
+// TestScrubsClientReplayedToolCallStandIn covers the parenthesised stand-in that
+// a since-removed version of this proxy wrote into assistant turns. Deleting the
+// writer did not clean up: the client had already saved those replies in its
+// session file and replays them as assistant history, so a request measured
+// textBytes=75 / text_len=75 stop=end_turn — the model reciting the 75-byte
+// string as its whole answer. Both the long and the short form must be scrubbed
+// off inbound assistant content, and a turn made of nothing else must not
+// survive as a hollow turn.
+func TestScrubsClientReplayedToolCallStandIn(t *testing.T) {
+	const longForm = "(assistant issued a tool call; the result appears in the following message)"
+	const shortForm = "(assistant issued a tool call)"
+
+	msgs := []ClaudeMessage{{Role: "user", Content: "start the task"}}
+	for i := 0; i < 4; i++ {
+		msgs = append(msgs,
+			ClaudeMessage{Role: "assistant", Content: longForm},
+			ClaudeMessage{Role: "user", Content: "continue"},
+			ClaudeMessage{Role: "assistant", Content: "Checking the config.\n\n" + shortForm},
+			ClaudeMessage{Role: "user", Content: "go on"},
+		)
+	}
+	msgs = append(msgs, ClaudeMessage{Role: "user", Content: "final question"})
+
+	payload := ClaudeToKiro(&ClaudeRequest{Model: "claude-opus-4.8", Messages: msgs}, false)
+
+	var combined strings.Builder
+	for i, h := range payload.ConversationState.History {
+		a := h.AssistantResponseMessage
+		if a == nil {
+			continue
+		}
+		if strings.Contains(a.Content, "(assistant issued a tool call") {
+			t.Fatalf("history[%d] still replays the tool-call stand-in: %q", i, a.Content)
+		}
+		if strings.TrimSpace(a.Content) == "" {
+			t.Fatalf("history[%d] is a hollow assistant turn that should have been dropped", i)
+		}
+		combined.WriteString(a.Content)
+		combined.WriteString("\n")
+	}
+
+	// Genuine prose sharing a turn with the stand-in must survive.
+	if !strings.Contains(combined.String(), "Checking the config.") {
+		t.Fatalf("expected surrounding assistant prose to survive scrubbing, got:\n%s", combined.String())
+	}
+}
+
 // TestScrubsClientReplayedToolCallText covers the recovery path: a polluted
 // client stored the model's "[Called tool ...]" text output as assistant
 // history and replays it. The proxy must strip that text from assistant turns

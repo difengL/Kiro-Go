@@ -107,8 +107,7 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
 	openaiReq.Model = actualModel
 
-	// 单次 BPE 编码同时产出总 token 与逐消息 token，供缓存 profile 复用。
-	estimatedInputTokens, perMsgTokens := estimateOpenAIRequestInputTokensDetailed(openaiReq)
+	estimatedInputTokens := estimateOpenAIRequestInputTokens(openaiReq)
 	kiroPayload := OpenAIToKiro(openaiReq, thinking)
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
@@ -118,22 +117,19 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	// > previous_response_id 链根 > 内容锚点（基于组装后的完整消息列表）。
 	convID, convSource := ResolveResponsesConversationIDWithSource(r, actualModel, finalMessages, &req)
 
-	// GPT 缓存命中模拟：与 Chat 路径共用同一个 OpenAIRequest 构建器。
-	gptProfile := h.promptCache.BuildOpenAIProfile(openaiReq, estimatedInputTokens, perMsgTokens)
-
 	if req.Stream {
-		h.handleResponsesStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens, gptProfile,
+		h.handleResponsesStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens,
 			apiKeyID, convID, convSource, respID, &req, storedInputCopy, storeResponse)
 		return
 	}
 
-	h.handleResponsesNonStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens, gptProfile,
+	h.handleResponsesNonStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens,
 		apiKeyID, convID, convSource, respID, &req, storedInputCopy, storeResponse)
 }
 
 func (h *Handler) handleResponsesNonStream(
 	w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
-	estimatedInputTokens int, gptProfile *promptCacheProfile, apiKeyID, convID, convSource, respID string,
+	estimatedInputTokens int, apiKeyID, convID, convSource, respID string,
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
 ) {
 	excluded := make(map[string]bool)
@@ -151,8 +147,6 @@ func (h *Handler) handleResponsesNonStream(
 			h.failAccount(convID, account, err)
 			continue
 		}
-
-		gptUsage := h.promptCache.Compute(account.ID, gptProfile)
 
 		var content, reasoningContent string
 		var toolUses []KiroToolUse
@@ -172,7 +166,7 @@ func (h *Handler) handleResponsesNonStream(
 			OnComplete: func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
 			OnCredits:  func(c float64) { credits = c },
 			OnContextUsage: func(pct float64) {
-				realInputTokens = int(pct * float64(h.effectiveContextWindow(model)) / 100.0)
+				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
 		}
 
@@ -200,9 +194,8 @@ func (h *Handler) handleResponsesNonStream(
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.recordSuccessLog("responses", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
-		h.promptCache.Update(account.ID, gptProfile)
 
-		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req, gptUsage.CacheReadInputTokens)
+		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req)
 		respObj.StoredInput = storedInput
 		respObj.Instructions = req.Instructions
 		h.rememberResponsesAccount(convID, respObj, account.ID)
@@ -254,7 +247,7 @@ func (h *Handler) rememberResponsesAccount(convID string, resp *ResponsesObject,
 
 func buildResponsesObject(
 	id, model, content string, toolUses []KiroToolUse,
-	inputTokens, outputTokens int, req *ResponsesRequest, cachedTokens int,
+	inputTokens, outputTokens int, req *ResponsesRequest,
 ) *ResponsesObject {
 	output := make([]ResponseOutputItem, 0, 1+len(toolUses))
 
@@ -296,32 +289,22 @@ func buildResponsesObject(
 		})
 	}
 
-	resp := &ResponsesObject{
+	return &ResponsesObject{
 		ID:                 id,
 		Object:             "response",
 		CreatedAt:          time.Now().Unix(),
 		Status:             "completed",
 		Model:              model,
 		Output:             output,
-		Usage: ResponsesUsage{
-			InputTokens:  inputTokens,
-			OutputTokens: outputTokens,
-			TotalTokens:  inputTokens + outputTokens,
-		},
+		Usage:              ResponsesUsage{InputTokens: inputTokens, OutputTokens: outputTokens, TotalTokens: inputTokens + outputTokens},
 		PreviousResponseID: req.PreviousResponseID,
 		Metadata:           req.Metadata,
 	}
-
-	// 官方语义：input_tokens 报全量输入，缓存命中单列。
-	if cachedTokens > 0 {
-		resp.Usage.InputTokensDetails = &ResponsesInputTokensDetails{CachedTokens: cachedTokens}
-	}
-	return resp
 }
 
 func (h *Handler) handleResponsesStream(
 	w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
-	estimatedInputTokens int, gptProfile *promptCacheProfile, apiKeyID, convID, convSource, respID string,
+	estimatedInputTokens int, apiKeyID, convID, convSource, respID string,
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
 ) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
@@ -381,8 +364,6 @@ func (h *Handler) handleResponsesStream(
 			"type":     "response.in_progress",
 			"response": initial,
 		})
-
-		gptUsage := h.promptCache.Compute(account.ID, gptProfile)
 
 		var (
 			fullText        strings.Builder
@@ -516,7 +497,7 @@ func (h *Handler) handleResponsesStream(
 			OnComplete: func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
 			OnCredits:  func(c float64) { credits = c },
 			OnContextUsage: func(pct float64) {
-				realInputTokens = int(pct * float64(h.effectiveContextWindow(model)) / 100.0)
+				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
 		}
 
@@ -587,9 +568,8 @@ func (h *Handler) handleResponsesStream(
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.recordSuccessLog("responses", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
-		h.promptCache.Update(account.ID, gptProfile)
 
-		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req, gptUsage.CacheReadInputTokens)
+		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req)
 		respObj.CreatedAt = createdAt
 		respObj.StoredInput = storedInput
 		respObj.Instructions = req.Instructions

@@ -855,6 +855,10 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	// ========== [TOKEN DEBUG] 原始 Claude 请求报文 ==========
+	logger.Infof("[TokenDebug][Claude] ==================== 请求开始 ====================")
+	logger.Infof("[TokenDebug][Claude] 原始请求报文 (body length=%d):\n%s", len(body), string(body))
+
 	var req ClaudeRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		h.sendClaudeError(w, 400, "invalid_request_error", "Invalid JSON: "+err.Error())
@@ -872,7 +876,38 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	effectiveReq := cloneClaudeRequestForThinking(&req, thinking)
 	thinkingResponseOpts := resolveClaudeThinkingResponseOptions(req.Thinking, thinkingCfg.ClaudeFormat)
 	estimatedInputTokens := estimateClaudeRequestInputTokens(effectiveReq)
+
+	// ========== [TOKEN DEBUG] 输入 Token 估算明细 ==========
+	logger.Infof("[TokenDebug][Claude] 模型=%s, thinking=%v", actualModel, thinking)
+	logger.Infof("[TokenDebug][Claude] 估算输入 Token 总数=%d", estimatedInputTokens)
+	// 拆分: System 部分
+	sysTokens := estimateClaudeValueTokens(effectiveReq.System)
+	logger.Infof("[TokenDebug][Claude]   ├─ System 部分 tokens=%d, 内容: %v", sysTokens, effectiveReq.System)
+	// 拆分: 每条消息
+	for i, msg := range effectiveReq.Messages {
+		msgTokens := estimateClaudeValueTokens(msg.Content)
+		contentJSON, _ := json.Marshal(msg.Content)
+		logger.Infof("[TokenDebug][Claude]   ├─ Message[%d] role=%s tokens=%d, 内容: %s", i, msg.Role, msgTokens, string(contentJSON))
+	}
+	// 拆分: Tools 部分
+	if len(effectiveReq.Tools) > 0 {
+		toolsTotal := 0
+		for _, tool := range effectiveReq.Tools {
+			t := estimateApproxTokens(tool.Name) + estimateApproxTokens(tool.Description) + estimateJSONTokens(tool.InputSchema)
+			toolsTotal += t
+		}
+		logger.Infof("[TokenDebug][Claude]   └─ Tools 部分 tokens=%d (共 %d 个工具)", toolsTotal, len(effectiveReq.Tools))
+	}
+
 	cacheProfile := h.promptCache.BuildClaudeProfile(effectiveReq, estimatedInputTokens)
+	if cacheProfile != nil {
+		logger.Infof("[TokenDebug][Claude] Cache Profile: %d 个 breakpoints, TotalInputTokens=%d", len(cacheProfile.Breakpoints), cacheProfile.TotalInputTokens)
+		for i, bp := range cacheProfile.Breakpoints {
+			logger.Infof("[TokenDebug][Claude]   └─ Breakpoint[%d]: CumulativeTokens=%d, TTL=%s, Fingerprint=%x...", i, bp.CumulativeTokens, bp.TTL, bp.Fingerprint[:4])
+		}
+	} else {
+		logger.Infof("[TokenDebug][Claude] Cache Profile: nil (无 cache_control 标记)")
+	}
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 
@@ -894,7 +929,7 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	kiroPayload := ClaudeToKiro(&req, thinking)
 
 	// Stream or non-stream
-	convID := ResolveClaudeConversationID(&req)
+	convID := ResolveClaudeConversationID(r, &req)
 	if req.Stream {
 		h.handleClaudeStream(r.Context(), w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, convID)
 	} else {
@@ -953,7 +988,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			h.failAccount(convID, account, err)
 			continue
 		}
 		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
@@ -1271,7 +1306,11 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 				credits = c
 			},
 			OnContextUsage: func(pct float64) {
-				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+				ctxWindow := getContextWindowSize(model)
+				realInputTokens = int(pct * float64(ctxWindow) / 100.0)
+				// ========== [TOKEN DEBUG] contextUsagePercentage 原始值 ==========
+				logger.Infof("[TokenDebug] contextUsagePercentage=%.6f%%, contextWindow=%d, 计算 realInputTokens=%d, model=%s",
+					pct, ctxWindow, realInputTokens, model)
 			},
 			OnStopReason: func(reason string) {
 				upstreamStopReason = reason
@@ -1314,7 +1353,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			lastErr = err
 			excluded[account.ID] = true
 			if !isStreamIntegrityError(err) {
-				h.handleAccountFailure(account, err)
+				h.failAccount(convID, account, err)
 			}
 			if !messageStarted {
 				continue
@@ -1347,6 +1386,29 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			thinkingOutput = ""
 		}
 		outputTokens = estimateClaudeOutputTokens(outputContent, thinkingOutput, toolUses)
+
+		// ========== [TOKEN DEBUG] Claude Stream 最终 Token 计算 ==========
+		logger.Infof("[TokenDebug][Claude][Stream] ============ 响应完成 ============")
+		logger.Infof("[TokenDebug][Claude][Stream] 上游原始 inputTokens=%d, outputTokens=%d", inputTokens, outputTokens)
+		logger.Infof("[TokenDebug][Claude][Stream] realInputTokens(from contextUsage%%)=%d, estimatedInputTokens=%d", realInputTokens, estimatedInputTokens)
+		logger.Infof("[TokenDebug][Claude][Stream] 最终采用 inputTokens=%d (来源: %s)", inputTokens, func() string {
+			if realInputTokens > 0 { return "contextUsagePercentage" }
+			return "upstream/estimated"
+		}())
+		logger.Infof("[TokenDebug][Claude][Stream] 输出内容估算: content=%q (%d tokens), thinking=%q (%d tokens), toolUses=%d",
+			truncateForLog(outputContent), estimateApproxTokens(outputContent),
+			truncateForLog(thinkingOutput), estimateApproxTokens(thinkingOutput), len(toolUses))
+		logger.Infof("[TokenDebug][Claude][Stream] 最终 outputTokens=%d (本地重新估算, 非上游值)", outputTokens)
+		logger.Infof("[TokenDebug][Claude][Stream] Cache 计算结果: CacheRead=%d, CacheCreation=%d, 5m=%d, 1h=%d",
+			cacheUsage.CacheReadInputTokens, cacheUsage.CacheCreationInputTokens,
+			cacheUsage.CacheCreation5mInputTokens, cacheUsage.CacheCreation1hInputTokens)
+		billedInput := billedClaudeInputTokens(inputTokens, cacheUsage)
+		logger.Infof("[TokenDebug][Claude][Stream] 最终 billed input_tokens = inputTokens(%d) - CacheCreation(%d) - CacheRead(%d) = %d",
+			inputTokens, cacheUsage.CacheCreationInputTokens, cacheUsage.CacheReadInputTokens, billedInput)
+		logger.Infof("[TokenDebug][Claude][Stream] 最终发给客户端: input_tokens=%d, output_tokens=%d, cache_creation=%d, cache_read=%d",
+			billedInput, outputTokens, cacheUsage.CacheCreationInputTokens, cacheUsage.CacheReadInputTokens)
+		logger.Infof("[TokenDebug][Claude][Stream] credits=%f, account=%s", credits, account.ID)
+		logger.Infof("[TokenDebug][Claude][Stream] ========================================")
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
@@ -1548,7 +1610,7 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			h.failAccount(convID, account, err)
 			continue
 		}
 		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
@@ -1580,7 +1642,11 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 				credits = c
 			},
 			OnContextUsage: func(pct float64) {
-				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+				ctxWindow := getContextWindowSize(model)
+				realInputTokens = int(pct * float64(ctxWindow) / 100.0)
+				// ========== [TOKEN DEBUG] contextUsagePercentage 原始值 ==========
+				logger.Infof("[TokenDebug] contextUsagePercentage=%.6f%%, contextWindow=%d, 计算 realInputTokens=%d, model=%s",
+					pct, ctxWindow, realInputTokens, model)
 			},
 			OnStopReason: func(reason string) {
 				upstreamStopReason = reason
@@ -1612,7 +1678,7 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 			lastErr = err
 			excluded[account.ID] = true
 			if !isStreamIntegrityError(err) {
-				h.handleAccountFailure(account, err)
+				h.failAccount(convID, account, err)
 			}
 			continue
 		}
@@ -1633,6 +1699,29 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 			inputTokens = estimatedInputTokens
 		}
 		outputTokens = estimateClaudeOutputTokens(finalContent, rawThinkingContent, toolUses)
+
+		// ========== [TOKEN DEBUG] Claude NonStream 最终 Token 计算 ==========
+		logger.Infof("[TokenDebug][Claude][NonStream] ============ 响应完成 ============")
+		logger.Infof("[TokenDebug][Claude][NonStream] 上游原始 inputTokens=%d, outputTokens=%d", inputTokens, outputTokens)
+		logger.Infof("[TokenDebug][Claude][NonStream] realInputTokens(from contextUsage%%)=%d, estimatedInputTokens=%d", realInputTokens, estimatedInputTokens)
+		logger.Infof("[TokenDebug][Claude][NonStream] 最终采用 inputTokens=%d (来源: %s)", inputTokens, func() string {
+			if realInputTokens > 0 { return "contextUsagePercentage" }
+			return "upstream/estimated"
+		}())
+		logger.Infof("[TokenDebug][Claude][NonStream] 输出内容估算: content=%q (%d tokens), thinking=%q (%d tokens), toolUses=%d",
+			truncateForLog(finalContent), estimateApproxTokens(finalContent),
+			truncateForLog(rawThinkingContent), estimateApproxTokens(rawThinkingContent), len(toolUses))
+		logger.Infof("[TokenDebug][Claude][NonStream] 最终 outputTokens=%d (本地重新估算, 非上游值)", outputTokens)
+		logger.Infof("[TokenDebug][Claude][NonStream] Cache 计算结果: CacheRead=%d, CacheCreation=%d, 5m=%d, 1h=%d",
+			cacheUsage.CacheReadInputTokens, cacheUsage.CacheCreationInputTokens,
+			cacheUsage.CacheCreation5mInputTokens, cacheUsage.CacheCreation1hInputTokens)
+		billedInput := billedClaudeInputTokens(inputTokens, cacheUsage)
+		logger.Infof("[TokenDebug][Claude][NonStream] 最终 billed input_tokens = inputTokens(%d) - CacheCreation(%d) - CacheRead(%d) = %d",
+			inputTokens, cacheUsage.CacheCreationInputTokens, cacheUsage.CacheReadInputTokens, billedInput)
+		logger.Infof("[TokenDebug][Claude][NonStream] 最终发给客户端: input_tokens=%d, output_tokens=%d, cache_creation=%d, cache_read=%d",
+			billedInput, outputTokens, cacheUsage.CacheCreationInputTokens, cacheUsage.CacheReadInputTokens)
+		logger.Infof("[TokenDebug][Claude][NonStream] credits=%f, account=%s", credits, account.ID)
+		logger.Infof("[TokenDebug][Claude][NonStream] =============================================")
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
@@ -1708,6 +1797,10 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ========== [TOKEN DEBUG] 原始 OpenAI 请求报文 ==========
+	logger.Infof("[TokenDebug][OpenAI] ==================== 请求开始 ====================")
+	logger.Infof("[TokenDebug][OpenAI] 原始请求报文 (body length=%d):\n%s", len(body), string(body))
+
 	var req OpenAIRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		h.sendOpenAIError(w, 400, "invalid_request_error", "Invalid JSON")
@@ -1724,8 +1817,31 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	req.Model = actualModel
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(&req)
 
+	// ========== [TOKEN DEBUG] 输入 Token 估算明细 ==========
+	logger.Infof("[TokenDebug][OpenAI] 模型=%s, thinking=%v", actualModel, thinking)
+	logger.Infof("[TokenDebug][OpenAI] 估算输入 Token 总数=%d", estimatedInputTokens)
+	for i, msg := range req.Messages {
+		msgTokens := estimateOpenAIContentTokens(msg.Content)
+		contentJSON, _ := json.Marshal(msg.Content)
+		logger.Infof("[TokenDebug][OpenAI]   ├─ Message[%d] role=%s tokens=%d, 内容: %s", i, msg.Role, msgTokens, string(contentJSON))
+		if len(msg.ToolCalls) > 0 {
+			for j, tc := range msg.ToolCalls {
+				tcTokens := estimateApproxTokens(tc.Function.Name) + estimateApproxTokens(tc.Function.Arguments)
+				logger.Infof("[TokenDebug][OpenAI]   │   └─ ToolCall[%d] %s tokens=%d, args: %s", j, tc.Function.Name, tcTokens, truncateForLog(tc.Function.Arguments))
+			}
+		}
+	}
+	if len(req.Tools) > 0 {
+		toolsTotal := 0
+		for _, tool := range req.Tools {
+			t := estimateApproxTokens(tool.Function.Name) + estimateApproxTokens(tool.Function.Description) + estimateJSONTokens(tool.Function.Parameters)
+			toolsTotal += t
+		}
+		logger.Infof("[TokenDebug][OpenAI]   └─ Tools 定义部分 tokens=%d (共 %d 个工具)", toolsTotal, len(req.Tools))
+	}
+
 	kiroPayload := OpenAIToKiro(&req, thinking)
-	convID := ResolveOpenAIConversationID(&req)
+	convID := ResolveOpenAIConversationID(r, &req)
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	if req.Stream {
@@ -1763,7 +1879,7 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			h.failAccount(convID, account, err)
 			continue
 		}
 
@@ -2059,7 +2175,11 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 				credits = c
 			},
 			OnContextUsage: func(pct float64) {
-				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+				ctxWindow := getContextWindowSize(model)
+				realInputTokens = int(pct * float64(ctxWindow) / 100.0)
+				// ========== [TOKEN DEBUG] contextUsagePercentage 原始值 ==========
+				logger.Infof("[TokenDebug] contextUsagePercentage=%.6f%%, contextWindow=%d, 计算 realInputTokens=%d, model=%s",
+					pct, ctxWindow, realInputTokens, model)
 			},
 		}
 
@@ -2099,7 +2219,7 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 			excluded[account.ID] = true
 			// Integrity failures are upstream hiccups, not account faults.
 			if !isStreamIntegrityError(err) {
-				h.handleAccountFailure(account, err)
+				h.failAccount(convID, account, err)
 			}
 			if !responseStarted {
 				continue
@@ -2133,10 +2253,32 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 			outputTokens += estimateApproxTokens(tc.Function.Arguments)
 		}
 
+		// ========== [TOKEN DEBUG] OpenAI Stream 最终 Token 计算 ==========
+		logger.Infof("[TokenDebug][OpenAI][Stream] ============ 响应完成 ============")
+		logger.Infof("[TokenDebug][OpenAI][Stream] 上游原始 inputTokens=%d, outputTokens=%d (来自上游 event stream 的 usage 字段)", inputTokens, outputTokens)
+		logger.Infof("[TokenDebug][OpenAI][Stream] realInputTokens(from contextUsage%%)=%d, estimatedInputTokens=%d", realInputTokens, estimatedInputTokens)
+		logger.Infof("[TokenDebug][OpenAI][Stream] 最终采用 inputTokens=%d (来源: %s)", inputTokens, func() string {
+			if realInputTokens > 0 { return "contextUsagePercentage" }
+			return "upstream/estimated"
+		}())
+		logger.Infof("[TokenDebug][OpenAI][Stream] 输出内容估算: content=%q (%d tokens), reasoning=%q (%d tokens), toolCalls=%d",
+			truncateForLog(outputContent), estimateApproxTokens(outputContent),
+			truncateForLog(reasoningOutput), estimateApproxTokens(reasoningOutput), len(toolCalls))
+		logger.Infof("[TokenDebug][OpenAI][Stream] 最终 outputTokens=%d (本地重新估算, 非上游值)", outputTokens)
+		cacheDetails := resolveOpenAICacheUsage(h.promptCache, account.ID, payload, inputTokens)
+		if cacheDetails != nil {
+			logger.Infof("[TokenDebug][OpenAI][Stream] Cache Details: cached_tokens=%d, cache_write_tokens=%d", cacheDetails.CachedTokens, cacheDetails.CacheWriteTokens)
+		} else {
+			logger.Infof("[TokenDebug][OpenAI][Stream] Cache Details: nil")
+		}
+		logger.Infof("[TokenDebug][OpenAI][Stream] 最终发给客户端: prompt_tokens=%d, completion_tokens=%d, total_tokens=%d",
+			inputTokens, outputTokens, inputTokens+outputTokens)
+		logger.Infof("[TokenDebug][OpenAI][Stream] credits=%f, account=%s", credits, account.ID)
+		logger.Infof("[TokenDebug][OpenAI][Stream] ========================================")
+
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-		cacheDetails := resolveOpenAICacheUsage(h.promptCache, account.ID, payload, inputTokens)
 		h.recordSuccessLog("openai", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 		h.pool.Remember(convID, account.ID)
 
@@ -2184,7 +2326,7 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
 			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			h.failAccount(convID, account, err)
 			continue
 		}
 
@@ -2208,7 +2350,11 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 			OnComplete: func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
 			OnCredits:  func(c float64) { credits = c },
 			OnContextUsage: func(pct float64) {
-				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+				ctxWindow := getContextWindowSize(model)
+				realInputTokens = int(pct * float64(ctxWindow) / 100.0)
+				// ========== [TOKEN DEBUG] contextUsagePercentage 原始值 ==========
+				logger.Infof("[TokenDebug] contextUsagePercentage=%.6f%%, contextWindow=%d, 计算 realInputTokens=%d, model=%s",
+					pct, ctxWindow, realInputTokens, model)
 			},
 			OnStopReason: func(reason string) {
 				upstreamStopReason = reason
@@ -2241,7 +2387,7 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 			excluded[account.ID] = true
 			// Integrity failures are upstream hiccups, not account faults.
 			if !isStreamIntegrityError(err) {
-				h.handleAccountFailure(account, err)
+				h.failAccount(convID, account, err)
 			}
 			continue
 		}
@@ -2260,10 +2406,32 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 		}
 		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
 
+		// ========== [TOKEN DEBUG] OpenAI NonStream 最终 Token 计算 ==========
+		logger.Infof("[TokenDebug][OpenAI][NonStream] ============ 响应完成 ============")
+		logger.Infof("[TokenDebug][OpenAI][NonStream] 上游原始 inputTokens=%d, outputTokens=%d (来自上游 event stream 的 usage 字段)", inputTokens, outputTokens)
+		logger.Infof("[TokenDebug][OpenAI][NonStream] realInputTokens(from contextUsage%%)=%d, estimatedInputTokens=%d", realInputTokens, estimatedInputTokens)
+		logger.Infof("[TokenDebug][OpenAI][NonStream] 最终采用 inputTokens=%d (来源: %s)", inputTokens, func() string {
+			if realInputTokens > 0 { return "contextUsagePercentage" }
+			return "upstream/estimated"
+		}())
+		logger.Infof("[TokenDebug][OpenAI][NonStream] 输出内容估算: content=%q (%d tokens), reasoning=%q (%d tokens), toolUses=%d",
+			truncateForLog(finalContent), estimateApproxTokens(finalContent),
+			truncateForLog(reasoningContent), estimateApproxTokens(reasoningContent), len(toolUses))
+		logger.Infof("[TokenDebug][OpenAI][NonStream] 最终 outputTokens=%d (本地重新估算, 非上游值)", outputTokens)
+		cacheDetails := resolveOpenAICacheUsage(h.promptCache, account.ID, payload, inputTokens)
+		if cacheDetails != nil {
+			logger.Infof("[TokenDebug][OpenAI][NonStream] Cache Details: cached_tokens=%d, cache_write_tokens=%d", cacheDetails.CachedTokens, cacheDetails.CacheWriteTokens)
+		} else {
+			logger.Infof("[TokenDebug][OpenAI][NonStream] Cache Details: nil")
+		}
+		logger.Infof("[TokenDebug][OpenAI][NonStream] 最终发给客户端: prompt_tokens=%d, completion_tokens=%d, total_tokens=%d",
+			inputTokens, outputTokens, inputTokens+outputTokens)
+		logger.Infof("[TokenDebug][OpenAI][NonStream] credits=%f, account=%s", credits, account.ID)
+		logger.Infof("[TokenDebug][OpenAI][NonStream] =============================================")
+
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-		cacheDetails := resolveOpenAICacheUsage(h.promptCache, account.ID, payload, inputTokens)
 		h.recordSuccessLog("openai", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 		h.pool.Remember(convID, account.ID)
 

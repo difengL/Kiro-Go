@@ -737,7 +737,7 @@ func TestResolveClaudeConversationID_Deterministic(t *testing.T) {
 		},
 		MaxTokens: 100,
 	}
-	id1 := ResolveClaudeConversationID(req)
+	id1 := ResolveClaudeConversationID(nil, req)
 	if id1 == "" {
 		t.Fatal("want non-empty convID for real anchor")
 	}
@@ -754,7 +754,7 @@ func TestResolveClaudeConversationID_Deterministic(t *testing.T) {
 		},
 		MaxTokens: 100,
 	}
-	id2 := ResolveClaudeConversationID(req2)
+	id2 := ResolveClaudeConversationID(nil, req2)
 	if id1 != id2 {
 		t.Fatalf("same anchor+system+model should produce same convID: %q vs %q", id1, id2)
 	}
@@ -768,7 +768,7 @@ func TestResolveClaudeConversationID_SyntheticAnchorEmpty(t *testing.T) {
 		},
 		MaxTokens: 100,
 	}
-	if id := ResolveClaudeConversationID(req); id != "" {
+	if id := ResolveClaudeConversationID(nil, req); id != "" {
 		t.Fatalf("synthetic anchor should yield empty convID, got %q", id)
 	}
 }
@@ -779,7 +779,7 @@ func TestResolveClaudeConversationID_NoAnchorEmpty(t *testing.T) {
 		Messages: []ClaudeMessage{{Role: "assistant", Content: "hi"}},
 		MaxTokens: 100,
 	}
-	if id := ResolveClaudeConversationID(req); id != "" {
+	if id := ResolveClaudeConversationID(nil, req); id != "" {
 		t.Fatalf("no user anchor should yield empty convID, got %q", id)
 	}
 }
@@ -792,7 +792,7 @@ func TestResolveOpenAIConversationID_Deterministic(t *testing.T) {
 			{Role: "assistant", Content: "2"},
 		},
 	}
-	id1 := ResolveOpenAIConversationID(req)
+	id1 := ResolveOpenAIConversationID(nil, req)
 	if !strings.Contains(id1, "-") {
 		t.Fatalf("want uuid-like convID, got %q", id1)
 	}
@@ -806,7 +806,7 @@ func TestResolveOpenAIConversationID_Deterministic(t *testing.T) {
 			{Role: "user", Content: "And 2+2?"},
 		},
 	}
-	id2 := ResolveOpenAIConversationID(req2)
+	id2 := ResolveOpenAIConversationID(nil, req2)
 	if id1 != id2 {
 		t.Fatalf("same anchor+system+model should produce same convID: %q vs %q", id1, id2)
 	}
@@ -819,7 +819,7 @@ func TestResolveOpenAIConversationID_SyntheticAnchorEmpty(t *testing.T) {
 			{Role: "user", Content: "."},
 		},
 	}
-	if id := ResolveOpenAIConversationID(req); id != "" {
+	if id := ResolveOpenAIConversationID(nil, req); id != "" {
 		t.Fatalf("synthetic anchor should yield empty convID, got %q", id)
 	}
 }
@@ -829,7 +829,7 @@ func TestResolveOpenAIConversationID_NoAnchorEmpty(t *testing.T) {
 		Model:    "gpt-4",
 		Messages: []OpenAIMessage{{Role: "assistant", Content: "hi"}},
 	}
-	if id := ResolveOpenAIConversationID(req); id != "" {
+	if id := ResolveOpenAIConversationID(nil, req); id != "" {
 		t.Fatalf("no user anchor should yield empty convID, got %q", id)
 	}
 }
@@ -846,7 +846,7 @@ func TestResolveClaudeConversationID_SystemBlocks(t *testing.T) {
 		},
 		MaxTokens: 100,
 	}
-	id1 := ResolveClaudeConversationID(req)
+	id1 := ResolveClaudeConversationID(nil, req)
 	if id1 == "" {
 		t.Fatal("want non-empty convID for real anchor with system blocks")
 	}
@@ -865,7 +865,7 @@ func TestResolveClaudeConversationID_SystemBlocks(t *testing.T) {
 		},
 		MaxTokens: 100,
 	}
-	id2 := ResolveClaudeConversationID(req2)
+	id2 := ResolveClaudeConversationID(nil, req2)
 	if id1 != id2 {
 		t.Fatalf("same anchor+system blocks+model should produce same convID: %q vs %q", id1, id2)
 	}

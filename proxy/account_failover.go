@@ -194,3 +194,13 @@ func (h *Handler) handleAccountFailure(account *config.Account, err error) {
 		h.pool.RecordError(account.ID, false)
 	}
 }
+
+// failAccount 是会话路由请求失败的统一入口：先解绑该会话的亲和绑定并给坏号
+// 即时短期冷却（RecordAffinityFailure），再走既有失败处理（禁用/配额冷却等）。
+// convID 为空时 RecordAffinityFailure 仅做冷却，不解绑。
+func (h *Handler) failAccount(convID string, account *config.Account, err error) {
+	if account != nil {
+		h.pool.RecordAffinityFailure(convID, account.ID)
+	}
+	h.handleAccountFailure(account, err)
+}

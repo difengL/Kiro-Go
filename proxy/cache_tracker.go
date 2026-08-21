@@ -600,6 +600,15 @@ func scaleCacheUsageToRealInput(usage *promptCacheUsage, localTotalEstimate int,
 	usage.CacheReadInputTokens = int(float64(usage.CacheReadInputTokens) * scale)
 	usage.CacheCreation5mInputTokens = int(float64(usage.CacheCreation5mInputTokens) * scale)
 	usage.CacheCreation1hInputTokens = int(float64(usage.CacheCreation1hInputTokens) * scale)
+
+	// After scaling, recompute flat CacheCreationInputTokens from 5m + 1h
+	// because the minTokens threshold may have zeroed it out before scaling,
+	// while the 5m/1h fields (which are not subject to that threshold) were
+	// successfully scaled.
+	scaled5m1h := usage.CacheCreation5mInputTokens + usage.CacheCreation1hInputTokens
+	if scaled5m1h > usage.CacheCreationInputTokens {
+		usage.CacheCreationInputTokens = scaled5m1h
+	}
 }
 
 func buildClaudeUsageMap(inputTokens, outputTokens int, usage promptCacheUsage, includeCache bool) map[string]interface{} {

@@ -115,21 +115,21 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 
 	// 会话亲和：三级解析 convID——显式会话 ID（header/query/metadata conversation_id）
 	// > previous_response_id 链根 > 内容锚点（基于组装后的完整消息列表）。
-	convID := ResolveResponsesConversationID(r, actualModel, finalMessages, &req)
+	convID, convSource := ResolveResponsesConversationIDWithSource(r, actualModel, finalMessages, &req)
 
 	if req.Stream {
 		h.handleResponsesStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens,
-			apiKeyID, convID, respID, &req, storedInputCopy, storeResponse)
+			apiKeyID, convID, convSource, respID, &req, storedInputCopy, storeResponse)
 		return
 	}
 
 	h.handleResponsesNonStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens,
-		apiKeyID, convID, respID, &req, storedInputCopy, storeResponse)
+		apiKeyID, convID, convSource, respID, &req, storedInputCopy, storeResponse)
 }
 
 func (h *Handler) handleResponsesNonStream(
 	w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
-	estimatedInputTokens int, apiKeyID, convID, respID string,
+	estimatedInputTokens int, apiKeyID, convID, convSource, respID string,
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
 ) {
 	excluded := make(map[string]bool)
@@ -192,13 +192,13 @@ func (h *Handler) handleResponsesNonStream(
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
-		h.pool.Remember(convID, account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.recordSuccessLog("responses", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req)
 		respObj.StoredInput = storedInput
 		respObj.Instructions = req.Instructions
+		h.rememberResponsesAccount(convID, respObj, account.ID)
 
 		if storeResponse {
 			if saveErr := saveResponse(respObj); saveErr != nil {
@@ -217,6 +217,32 @@ func (h *Handler) handleResponsesNonStream(
 	}
 	h.recordFailureWithDetails("responses", model, "", lastErr)
 	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
+}
+
+// rememberResponsesAccount binds both the key used for this request and the
+// stable Responses chain-root key. The first turn normally has only a content
+// anchor; subsequent turns with previous_response_id use root_<id>, so both
+// keys must point at the account selected for the first successful turn.
+func (h *Handler) rememberResponsesAccount(convID string, resp *ResponsesObject, accountID string) {
+	if resp == nil {
+		return
+	}
+
+	rootID := resp.RootResponseID
+	if rootID == "" {
+		rootID = resp.ID
+		if resp.PreviousResponseID != "" {
+			if root := resolveChainRoot(resp.PreviousResponseID); root != "" {
+				rootID = root
+			}
+		}
+		resp.RootResponseID = rootID
+	}
+
+	h.pool.Remember(convID, accountID)
+	if rootID != "" {
+		h.pool.Remember(buildRootConversationID(rootID), accountID)
+	}
 }
 
 func buildResponsesObject(
@@ -278,7 +304,7 @@ func buildResponsesObject(
 
 func (h *Handler) handleResponsesStream(
 	w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
-	estimatedInputTokens int, apiKeyID, convID, respID string,
+	estimatedInputTokens int, apiKeyID, convID, convSource, respID string,
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
 ) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
@@ -540,7 +566,6 @@ func (h *Handler) handleResponsesStream(
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
-		h.pool.Remember(convID, account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.recordSuccessLog("responses", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
@@ -548,6 +573,7 @@ func (h *Handler) handleResponsesStream(
 		respObj.CreatedAt = createdAt
 		respObj.StoredInput = storedInput
 		respObj.Instructions = req.Instructions
+		h.rememberResponsesAccount(convID, respObj, account.ID)
 
 		if storeResponse {
 			if saveErr := saveResponse(respObj); saveErr != nil {

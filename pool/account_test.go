@@ -332,11 +332,11 @@ func TestReloadDropsOverQuotaAccountWhenAllowOverUsageDisabled(t *testing.T) {
 
 func newTestPoolWithAffinity(accounts []config.Account) *AccountPool {
 	p := &AccountPool{
-		accounts:   accounts,
-		cooldowns:  make(map[string]time.Time),
+		accounts:    accounts,
+		cooldowns:   make(map[string]time.Time),
 		errorCounts: make(map[string]int),
-		modelLists: make(map[string]map[string]bool),
-		affinity:   newAffinityRouter(5 * time.Minute),
+		modelLists:  make(map[string]map[string]bool),
+		affinity:    newAffinityRouter(5 * time.Minute),
 	}
 	p.totalAccounts = len(accounts)
 	return p

@@ -21,16 +21,16 @@ const tokenRefreshSkewSeconds int64 = 120
 
 // RequestLog stores details about a single API request (success or failure).
 type RequestLog struct {
-	Time      int64  `json:"time"`      // Unix timestamp
-	Endpoint  string `json:"endpoint"`  // claude/openai/responses
-	Model     string `json:"model"`     // Requested model
-	AccountID string `json:"accountId"` // Account used
-	Status    string `json:"status"`    // "success" or "error"
-	Error     string `json:"error"`     // Error message (empty on success)
-	ErrorType string `json:"errorType"` // Error category (empty on success)
-	Tokens    int    `json:"tokens"`    // Total tokens (input+output, 0 on failure)
-	Credits   float64 `json:"credits"`  // Credits consumed (0 on failure)
-	Duration  int64  `json:"duration"`  // Request duration in ms
+	Time      int64   `json:"time"`      // Unix timestamp
+	Endpoint  string  `json:"endpoint"`  // claude/openai/responses
+	Model     string  `json:"model"`     // Requested model
+	AccountID string  `json:"accountId"` // Account used
+	Status    string  `json:"status"`    // "success" or "error"
+	Error     string  `json:"error"`     // Error message (empty on success)
+	ErrorType string  `json:"errorType"` // Error category (empty on success)
+	Tokens    int     `json:"tokens"`    // Total tokens (input+output, 0 on failure)
+	Credits   float64 `json:"credits"`   // Credits consumed (0 on failure)
+	Duration  int64   `json:"duration"`  // Request duration in ms
 }
 
 const requestLogsMaxSize = 500
@@ -837,6 +837,13 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	// Stream or non-stream
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	convID := ResolveClaudeConversationID(r, &req)
+
+	// Diagnostics for premature-stop investigation. The failure only shows up on
+	// tool-result turns, so log the request shape: whether the tool results that
+	// came back carried an error, and whether the payload we hand upstream still
+	// has a real current input (an empty/placeholder one makes the model stop).
+	logClaudeRequestShape(convID, &req, kiroPayload)
+
 	if req.Stream {
 		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, convID)
 	} else {
@@ -1213,8 +1220,16 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			},
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+				// 排查措施4：上下文使用率超过 10% 时记录，用于关联分析提前停止。
+				if pct > 10.0 {
+					logger.Infof("[Claude] high_context conv=%s usage=%.2f%% est_input=%d model=%s",
+						shortConvLogID(convID), pct, realInputTokens, model)
+				}
 			},
 		}
+
+		// 排查措施5：初始化 StreamTruncated 指针，让 parseEventStream 能回写。
+		callback.StreamTruncated = new(bool)
 
 		err := CallKiroAPI(account, payload, callback)
 		if err != nil {
@@ -1260,10 +1275,25 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		h.promptCache.Update(account.ID, cacheProfile)
 		h.recordSuccessLog("claude", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
 
-		stopReason := "end_turn"
-		if len(toolUses) > 0 {
-			stopReason = "tool_use"
+		stopReason := claudeStopReason(toolUses)
+
+		// 排查措施3：标记异常短输出的 end_turn（提前停止的特征）。
+		prematureFlag := ""
+		if stopReason == "end_turn" && len(toolUses) == 0 && len(outputContent) < 100 {
+			prematureFlag = " ⚠️ PREMATURE_STOP"
 		}
+
+		// 排查措施5：检查流是否因网络中断而截断。
+		truncatedFlag := ""
+		if callback.StreamTruncated != nil && *callback.StreamTruncated {
+			truncatedFlag = " ⚠️ STREAM_TRUNCATED"
+		}
+
+		// 提前中断排查：end_turn + 无工具调用 + 文本极短，就是任务提前停止的特征。
+		logger.Infof("[Claude] done conv=%s stop=%s tool_uses=%d text_len=%d thinking_len=%d input=%d output=%d cache_read=%d cache_creation=%d stream=true%s%s",
+			shortConvLogID(convID), stopReason, len(toolUses), len(outputContent), len(thinkingOutput),
+			inputTokens, outputTokens, cacheUsage.CacheReadInputTokens, cacheUsage.CacheCreationInputTokens,
+			prematureFlag, truncatedFlag)
 
 		ensureMessageStart()
 		h.sendSSE(w, flusher, "message_delta", map[string]interface{}{
@@ -1541,6 +1571,11 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			}
 		}
 
+		// 提前中断排查：非流式路径同样记录本轮产出形态。
+		logger.Infof("[Claude] done conv=%s stop=%s tool_uses=%d text_len=%d thinking_len=%d input=%d output=%d cache_read=%d cache_creation=%d stream=false",
+			shortConvLogID(convID), claudeStopReason(toolUses), len(toolUses), len(finalContent), len(rawThinkingContent),
+			inputTokens, outputTokens, cacheUsage.CacheReadInputTokens, cacheUsage.CacheCreationInputTokens)
+
 		resp := KiroToClaudeResponse(finalContent, responseThinkingContent, includeEmptyThinkingBlock, toolUses, inputTokens, outputTokens, model)
 		resp.Usage.InputTokens = billedClaudeInputTokens(inputTokens, cacheUsage)
 		resp.Usage.CacheCreationInputTokens = cacheUsage.CacheCreationInputTokens
@@ -1575,6 +1610,85 @@ func (h *Handler) sendClaudeError(w http.ResponseWriter, status int, errType, me
 			"message": message,
 		},
 	})
+}
+
+// logClaudeRequestShape records the structural shape of an incoming Claude
+// request alongside what ClaudeToKiro produced. Premature stops show up here as
+// a request that carries tool_results but whose translated current input has
+// degraded (empty content, or the "." placeholder), which makes the upstream
+// model see an empty turn and reply end_turn.
+func logClaudeRequestShape(convID string, req *ClaudeRequest, payload *KiroPayload) {
+	if req == nil || payload == nil {
+		return
+	}
+
+	// Count tool_results and error results in the trailing user message.
+	toolResults, errorResults := 0, 0
+	lastRole, lastBlockTypes := "", ""
+	if n := len(req.Messages); n > 0 {
+		last := req.Messages[n-1]
+		lastRole = last.Role
+		if blocks, ok := last.Content.([]interface{}); ok {
+			types := make([]string, 0, len(blocks))
+			for _, b := range blocks {
+				block, ok := b.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				t, _ := block["type"].(string)
+				types = append(types, t)
+				if t == "tool_result" {
+					toolResults++
+					if isErr, _ := block["is_error"].(bool); isErr {
+						errorResults++
+					}
+				}
+			}
+			lastBlockTypes = strings.Join(types, ",")
+		} else if _, ok := last.Content.(string); ok {
+			lastBlockTypes = "string"
+		}
+	}
+
+	// A trailing role=system message is Claude Code's system-reminder.
+	reminderAtEnd := false
+	if n := len(req.Messages); n > 0 {
+		reminderAtEnd = req.Messages[n-1].Role == "system"
+	}
+
+	cur := payload.ConversationState.CurrentMessage.UserInputMessage
+	curLen := len(cur.Content)
+	curPlaceholder := strings.TrimSpace(cur.Content) == minimalFallbackUserContent
+	payloadToolResults := 0
+	if cur.UserInputMessageContext != nil {
+		payloadToolResults = len(cur.UserInputMessageContext.ToolResults)
+	}
+
+	logger.Infof("[Claude] request conv=%s msgs=%d tools=%d lastRole=%s lastBlocks=%s toolResults=%d errorResults=%d reminderAtEnd=%t -> curLen=%d curPlaceholder=%t payloadToolResults=%d history=%d",
+		shortConvLogID(convID), len(req.Messages), len(req.Tools), lastRole, lastBlockTypes,
+		toolResults, errorResults, reminderAtEnd,
+		curLen, curPlaceholder, payloadToolResults, len(payload.ConversationState.History))
+}
+
+// claudeStopReason mirrors the stop_reason the response will carry, so the
+// diagnostic log and the wire format can never disagree.
+func claudeStopReason(toolUses []KiroToolUse) string {
+	if len(toolUses) > 0 {
+		return "tool_use"
+	}
+	return "end_turn"
+}
+
+// shortConvLogID truncates a conversation ID for logging. Conversation IDs are
+// content-derived hashes, so a prefix is enough to correlate turns.
+func shortConvLogID(id string) string {
+	if id == "" {
+		return "-"
+	}
+	if len(id) > 16 {
+		return id[:16]
+	}
+	return id
 }
 
 // handleOpenAIChat OpenAI API 处理
@@ -1970,7 +2084,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.recordSuccessLog("openai", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
-			h.pool.Remember(convID, account.ID)
+		h.pool.Remember(convID, account.ID)
 
 		finishReason := "stop"
 		if len(toolCalls) > 0 {
@@ -2076,7 +2190,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.recordSuccessLog("openai", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
-			h.pool.Remember(convID, account.ID)
+		h.pool.Remember(convID, account.ID)
 
 		thinkingFormat := config.GetThinkingConfig().OpenAIFormat
 		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, model, thinkingFormat)
@@ -3011,11 +3125,11 @@ func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"apiKey":         config.GetApiKey(),
-		"requireApiKey":  config.IsApiKeyRequired(),
-		"port":           config.GetPort(),
-		"host":           config.GetHost(),
-		"allowOverUsage": config.GetAllowOverUsage(),
+		"apiKey":             config.GetApiKey(),
+		"requireApiKey":      config.IsApiKeyRequired(),
+		"port":               config.GetPort(),
+		"host":               config.GetHost(),
+		"allowOverUsage":     config.GetAllowOverUsage(),
 		"affinityEnabled":    config.GetAffinityEnabled(),
 		"affinityTTLMinutes": config.GetAffinityTTLMinutes(),
 	})
@@ -3066,12 +3180,12 @@ func (h *Handler) apiUpdatePromptFilter(w http.ResponseWriter, r *http.Request) 
 
 func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ApiKey         *string `json:"apiKey,omitempty"`
-		RequireApiKey  *bool   `json:"requireApiKey,omitempty"`
-		Password       string  `json:"password,omitempty"`
-		AllowOverUsage *bool   `json:"allowOverUsage,omitempty"`
-		AffinityEnabled    *bool `json:"affinityEnabled,omitempty"`
-		AffinityTTLMinutes *int  `json:"affinityTTLMinutes,omitempty"`
+		ApiKey             *string `json:"apiKey,omitempty"`
+		RequireApiKey      *bool   `json:"requireApiKey,omitempty"`
+		Password           string  `json:"password,omitempty"`
+		AllowOverUsage     *bool   `json:"allowOverUsage,omitempty"`
+		AffinityEnabled    *bool   `json:"affinityEnabled,omitempty"`
+		AffinityTTLMinutes *int    `json:"affinityTTLMinutes,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)

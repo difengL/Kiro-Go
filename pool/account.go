@@ -36,16 +36,16 @@ var (
 
 // GetPool 获取全局账号池单例
 func GetPool() *AccountPool {
-		poolOnce.Do(func() {
-			pool = &AccountPool{
-				cooldowns:   make(map[string]time.Time),
-				errorCounts: make(map[string]int),
-				modelLists:  make(map[string]map[string]bool),
-				affinity:    newAffinityRouter(time.Duration(config.GetAffinityTTLMinutes()) * time.Minute),
-			}
-			pool.Reload()
-			go pool.backgroundCleanupAffinity()
-		})
+	poolOnce.Do(func() {
+		pool = &AccountPool{
+			cooldowns:   make(map[string]time.Time),
+			errorCounts: make(map[string]int),
+			modelLists:  make(map[string]map[string]bool),
+			affinity:    newAffinityRouter(time.Duration(config.GetAffinityTTLMinutes()) * time.Minute),
+		}
+		pool.Reload()
+		go pool.backgroundCleanupAffinity()
+	})
 	return pool
 }
 
@@ -141,7 +141,7 @@ func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account
 		return acc
 	}
 
-		// 无可用账号，返回冷却时间最短的（排除额度用尽的，除非允许超额）
+	// 无可用账号，返回冷却时间最短的（排除额度用尽的，除非允许超额）
 	var best *config.Account
 	var earliest time.Time
 	for i := range p.accounts {
@@ -288,9 +288,17 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 // 亲和命中但账号不可用时，自动迁移到轮询选出的新号。
 // 绑定由 handler 在请求成功后调 Remember 完成。
 func (p *AccountPool) SelectForConversation(convID, model string, excluded map[string]bool) *config.Account {
+	acc, _ := p.SelectForConversationWithReason(convID, model, excluded)
+	return acc
+}
+
+// SelectForConversationWithReason is the diagnostic form of
+// SelectForConversation. The reason is one of: affinity_disabled_or_empty,
+// affinity_hit, bound_account_unavailable, or affinity_miss.
+func (p *AccountPool) SelectForConversationWithReason(convID, model string, excluded map[string]bool) (*config.Account, string) {
 	// 亲和未启用或空 key：直接轮询
 	if !config.GetAffinityEnabled() || convID == "" {
-		return p.GetNextForModelExcluding(model, excluded)
+		return p.GetNextForModelExcluding(model, excluded), "affinity_disabled_or_empty"
 	}
 
 	now := time.Now()
@@ -303,14 +311,15 @@ func (p *AccountPool) SelectForConversation(convID, model string, excluded map[s
 		usable := acc != nil && p.isAccountUsable(acc, model, excluded, now)
 		p.mu.RUnlock()
 		if usable {
-			return acc // 亲和命中，cache 窗口成立
+			return acc, "affinity_hit"
 		}
 		// 不可用：立即解绑（读路径兜底，防死绑定残留），迁移到轮询
 		// 注意：lookup 已释放 affinity 锁，此处重新加锁，不与 p.mu 嵌套。
 		p.affinity.unbind(convID)
+		return p.GetNextForModelExcluding(model, excluded), "bound_account_unavailable"
 	}
 	// 3. 轮询
-	return p.GetNextForModelExcluding(model, excluded)
+	return p.GetNextForModelExcluding(model, excluded), "affinity_miss"
 }
 
 // RecordAffinityFailure 在请求失败时解绑会话并给坏号一个即时短期冷却。

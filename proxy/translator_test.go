@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -871,3 +872,31 @@ func TestResolveClaudeConversationID_SystemBlocks(t *testing.T) {
 	}
 }
 
+
+func TestSystemReminderTailDoesNotDropToolResult(t *testing.T) {
+	// 回归测试：Claude Code 在工具结果回合往 messages 末尾追加 role=system 的
+	// system-reminder。当前输入必须取最后一条 user 消息，否则 tool_result 被降级
+	// 为历史、当前输入退化为 "."，上游模型收到空输入直接 end_turn（长任务提前停止）。
+	raw := `{
+	  "model": "claude-opus-5",
+	  "system": "you are a helpful agent",
+	  "messages": [
+	    {"role":"user","content":"帮我列出目录"},
+	    {"role":"assistant","content":[{"type":"tool_use","id":"tu_1","name":"Bash","input":{"command":"ls"}}]},
+	    {"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_1","content":"a.go b.go"}]},
+	    {"role":"system","content":"<system-reminder>background note</system-reminder>"}
+	  ]
+	}`
+	var req ClaudeRequest
+	if err := json.Unmarshal([]byte(raw), &req); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	p := ClaudeToKiro(&req, false)
+	cur := p.ConversationState.CurrentMessage.UserInputMessage
+	if cur.UserInputMessageContext == nil || len(cur.UserInputMessageContext.ToolResults) != 1 {
+		t.Fatalf("期望 tool_results=1 作为当前输入, 实际=%+v", cur)
+	}
+	if cur.Content == "." {
+		t.Fatalf("当前输入退化为占位符 '.'，tool_result 未作为当前输入")
+	}
+}

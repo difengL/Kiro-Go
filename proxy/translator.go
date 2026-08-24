@@ -215,8 +215,18 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	var currentImages []KiroImage
 	var currentToolResults []KiroToolResult
 
+	// Claude Code 会在 messages 末尾追加 system-reminder（role=system）。当前输入必须取
+	// 最后一条 user 消息，而不是物理最后一条，否则 tool_result 会被降级为历史、当前输入变空。
+	lastUserIdx := -1
+	for j := len(req.Messages) - 1; j >= 0; j-- {
+		if req.Messages[j].Role == "user" {
+			lastUserIdx = j
+			break
+		}
+	}
+
 	for i, msg := range req.Messages {
-		isLast := i == len(req.Messages)-1
+		isLast := i == lastUserIdx
 
 		if msg.Role == "user" {
 			content, images, toolResults := extractClaudeUserContent(msg.Content)

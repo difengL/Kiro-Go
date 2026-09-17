@@ -809,15 +809,38 @@ func extractUsageFromEvent(event map[string]interface{}) map[string]interface{} 
 // Per Kiro's ListAvailableModels, the 1M-token context window applies to
 // Claude 4.6 and newer (sonnet-4.6, opus-4.6, opus-4.7, opus-4.8, and future
 // 4.x releases), while 4.5 and earlier (opus-4.5, sonnet-4.5, sonnet-4,
-// haiku-4.5) use a 200K window. This value is used to convert the upstream
-// contextUsagePercentage into an absolute input-token count that clients rely
-// on to decide when to compact; an undersized window under-reports tokens and
-// prevents clients from compacting in time.
+// haiku-4.5) use a 200K window. GPT models are all treated as 1M. This value
+// is used to convert the upstream contextUsagePercentage into an absolute
+// input-token count that clients rely on to decide when to compact; an
+// undersized window under-reports tokens and prevents clients from compacting
+// in time.
 func getContextWindowSize(model string) int {
 	if isLargeContextModel(model) {
 		return 1_000_000
 	}
 	return 200_000
+}
+
+// resolveFinalInputTokens 决定最终上报的输入 token 数。三个来源各有失真：
+//   - upstreamUsage：上游 usage 事件里的真实值，最准但经常缺失；
+//   - realFromContextUsage：contextUsagePercentage × 上下文窗口换算，依赖对
+//     窗口大小的猜测，窗口猜小会严重低估；
+//   - estimated：请求可见文本的本地估算，是真实输入的下界。
+//
+// 取三者最大值，避免任一低估值单独决定上报数字。返回值附带命中来源，
+// 供 TokenDebug 日志使用。
+func resolveFinalInputTokens(realFromContextUsage, upstreamUsage, estimated int) (int, string) {
+	final := max(realFromContextUsage, upstreamUsage, estimated)
+	switch final {
+	case 0:
+		return 0, "none"
+	case realFromContextUsage:
+		return final, "contextUsagePercentage"
+	case upstreamUsage:
+		return final, "upstreamUsage"
+	default:
+		return final, "estimated"
+	}
 }
 
 // claudeVersionExtractor matches "claude-<family>-<major>[.<minor>]" (dot or
@@ -828,6 +851,10 @@ var claudeVersionExtractor = regexp.MustCompile(`claude-(?:opus|sonnet|haiku)-(\
 
 func isLargeContextModel(model string) bool {
 	m := strings.ToLower(model)
+	// GPT 系模型统一按 1M 上下文窗口换算（如 gpt-5.6-sol）。
+	if strings.Contains(m, "gpt") {
+		return true
+	}
 	if match := claudeVersionExtractor.FindStringSubmatch(m); match != nil {
 		major, errMaj := strconv.Atoi(match[1])
 		if errMaj == nil {

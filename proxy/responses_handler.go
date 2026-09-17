@@ -211,11 +211,8 @@ func (h *Handler) handleResponsesNonStream(
 			reasoningContent = ""
 		}
 
-		if realInputTokens > 0 {
-			inputTokens = realInputTokens
-		} else if inputTokens <= 0 {
-			inputTokens = estimatedInputTokens
-		}
+		resolvedInput, _ := resolveFinalInputTokens(realInputTokens, inputTokens, estimatedInputTokens)
+		inputTokens = resolvedInput
 		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
@@ -608,11 +605,8 @@ func (h *Handler) handleResponsesStream(
 			})
 		}
 
-		if realInputTokens > 0 {
-			inputTokens = realInputTokens
-		} else if inputTokens <= 0 {
-			inputTokens = estimatedInputTokens
-		}
+		resolvedInput, _ := resolveFinalInputTokens(realInputTokens, inputTokens, estimatedInputTokens)
+		inputTokens = resolvedInput
 		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoning, toolUses)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)

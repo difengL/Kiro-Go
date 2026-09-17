@@ -210,11 +210,7 @@ func (h *Handler) callUpstreamForWebSearch(ctx context.Context, req *ClaudeReque
 			continue
 		}
 
-		if realInputTokens > 0 {
-			inputTokens = realInputTokens
-		} else if inputTokens <= 0 {
-			inputTokens = estimatedInputTokens
-		}
+		inputTokens, _ = resolveFinalInputTokens(realInputTokens, inputTokens, estimatedInputTokens)
 
 		return &webSearchRoundOutcome{
 			text:               text,

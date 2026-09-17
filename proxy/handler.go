@@ -1372,11 +1372,8 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		}
 		closeActiveBlock()
 
-		if realInputTokens > 0 {
-			inputTokens = realInputTokens
-		} else if inputTokens <= 0 {
-			inputTokens = estimatedInputTokens
-		}
+		resolvedInput, resolvedSource := resolveFinalInputTokens(realInputTokens, inputTokens, estimatedInputTokens)
+		inputTokens = resolvedInput
 		outputContent, extractedReasoning := extractThinkingFromContent(rawContentBuilder.String())
 		thinkingOutput := rawThinkingBuilder.String()
 		if thinking && thinkingOutput == "" && extractedReasoning != "" {
@@ -1391,10 +1388,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		logger.Infof("[TokenDebug][Claude][Stream] ============ 响应完成 ============")
 		logger.Infof("[TokenDebug][Claude][Stream] 上游原始 inputTokens=%d, outputTokens=%d", inputTokens, outputTokens)
 		logger.Infof("[TokenDebug][Claude][Stream] realInputTokens(from contextUsage%%)=%d, estimatedInputTokens=%d", realInputTokens, estimatedInputTokens)
-		logger.Infof("[TokenDebug][Claude][Stream] 最终采用 inputTokens=%d (来源: %s)", inputTokens, func() string {
-			if realInputTokens > 0 { return "contextUsagePercentage" }
-			return "upstream/estimated"
-		}())
+		logger.Infof("[TokenDebug][Claude][Stream] 最终采用 inputTokens=%d (来源: max(%s))", inputTokens, resolvedSource)
 		logger.Infof("[TokenDebug][Claude][Stream] 输出内容估算: content=%q (%d tokens), thinking=%q (%d tokens), toolUses=%d",
 			truncateForLog(outputContent), estimateApproxTokens(outputContent),
 			truncateForLog(thinkingOutput), estimateApproxTokens(thinkingOutput), len(toolUses))
@@ -1693,21 +1687,15 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 			rawThinkingContent = ""
 		}
 
-		if realInputTokens > 0 {
-			inputTokens = realInputTokens
-		} else if inputTokens <= 0 {
-			inputTokens = estimatedInputTokens
-		}
+		resolvedInput, resolvedSource := resolveFinalInputTokens(realInputTokens, inputTokens, estimatedInputTokens)
+		inputTokens = resolvedInput
 		outputTokens = estimateClaudeOutputTokens(finalContent, rawThinkingContent, toolUses)
 
 		// ========== [TOKEN DEBUG] Claude NonStream 最终 Token 计算 ==========
 		logger.Infof("[TokenDebug][Claude][NonStream] ============ 响应完成 ============")
 		logger.Infof("[TokenDebug][Claude][NonStream] 上游原始 inputTokens=%d, outputTokens=%d", inputTokens, outputTokens)
 		logger.Infof("[TokenDebug][Claude][NonStream] realInputTokens(from contextUsage%%)=%d, estimatedInputTokens=%d", realInputTokens, estimatedInputTokens)
-		logger.Infof("[TokenDebug][Claude][NonStream] 最终采用 inputTokens=%d (来源: %s)", inputTokens, func() string {
-			if realInputTokens > 0 { return "contextUsagePercentage" }
-			return "upstream/estimated"
-		}())
+		logger.Infof("[TokenDebug][Claude][NonStream] 最终采用 inputTokens=%d (来源: max(%s))", inputTokens, resolvedSource)
 		logger.Infof("[TokenDebug][Claude][NonStream] 输出内容估算: content=%q (%d tokens), thinking=%q (%d tokens), toolUses=%d",
 			truncateForLog(finalContent), estimateApproxTokens(finalContent),
 			truncateForLog(rawThinkingContent), estimateApproxTokens(rawThinkingContent), len(toolUses))
@@ -2234,11 +2222,8 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 			sendChunk("", 3)
 		}
 
-		if realInputTokens > 0 {
-			inputTokens = realInputTokens
-		} else if inputTokens <= 0 {
-			inputTokens = estimatedInputTokens
-		}
+		resolvedInput, resolvedSource := resolveFinalInputTokens(realInputTokens, inputTokens, estimatedInputTokens)
+		inputTokens = resolvedInput
 		outputContent, extractedReasoning := extractThinkingFromContent(rawContentBuilder.String())
 		reasoningOutput := rawReasoningBuilder.String()
 		if thinking && reasoningOutput == "" && extractedReasoning != "" {
@@ -2257,10 +2242,7 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 		logger.Infof("[TokenDebug][OpenAI][Stream] ============ 响应完成 ============")
 		logger.Infof("[TokenDebug][OpenAI][Stream] 上游原始 inputTokens=%d, outputTokens=%d (来自上游 event stream 的 usage 字段)", inputTokens, outputTokens)
 		logger.Infof("[TokenDebug][OpenAI][Stream] realInputTokens(from contextUsage%%)=%d, estimatedInputTokens=%d", realInputTokens, estimatedInputTokens)
-		logger.Infof("[TokenDebug][OpenAI][Stream] 最终采用 inputTokens=%d (来源: %s)", inputTokens, func() string {
-			if realInputTokens > 0 { return "contextUsagePercentage" }
-			return "upstream/estimated"
-		}())
+		logger.Infof("[TokenDebug][OpenAI][Stream] 最终采用 inputTokens=%d (来源: max(%s))", inputTokens, resolvedSource)
 		logger.Infof("[TokenDebug][OpenAI][Stream] 输出内容估算: content=%q (%d tokens), reasoning=%q (%d tokens), toolCalls=%d",
 			truncateForLog(outputContent), estimateApproxTokens(outputContent),
 			truncateForLog(reasoningOutput), estimateApproxTokens(reasoningOutput), len(toolCalls))
@@ -2399,21 +2381,15 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 			reasoningContent = ""
 		}
 
-		if realInputTokens > 0 {
-			inputTokens = realInputTokens
-		} else if inputTokens <= 0 {
-			inputTokens = estimatedInputTokens
-		}
+		resolvedInput, resolvedSource := resolveFinalInputTokens(realInputTokens, inputTokens, estimatedInputTokens)
+		inputTokens = resolvedInput
 		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
 
 		// ========== [TOKEN DEBUG] OpenAI NonStream 最终 Token 计算 ==========
 		logger.Infof("[TokenDebug][OpenAI][NonStream] ============ 响应完成 ============")
 		logger.Infof("[TokenDebug][OpenAI][NonStream] 上游原始 inputTokens=%d, outputTokens=%d (来自上游 event stream 的 usage 字段)", inputTokens, outputTokens)
 		logger.Infof("[TokenDebug][OpenAI][NonStream] realInputTokens(from contextUsage%%)=%d, estimatedInputTokens=%d", realInputTokens, estimatedInputTokens)
-		logger.Infof("[TokenDebug][OpenAI][NonStream] 最终采用 inputTokens=%d (来源: %s)", inputTokens, func() string {
-			if realInputTokens > 0 { return "contextUsagePercentage" }
-			return "upstream/estimated"
-		}())
+		logger.Infof("[TokenDebug][OpenAI][NonStream] 最终采用 inputTokens=%d (来源: max(%s))", inputTokens, resolvedSource)
 		logger.Infof("[TokenDebug][OpenAI][NonStream] 输出内容估算: content=%q (%d tokens), reasoning=%q (%d tokens), toolUses=%d",
 			truncateForLog(finalContent), estimateApproxTokens(finalContent),
 			truncateForLog(reasoningContent), estimateApproxTokens(reasoningContent), len(toolUses))

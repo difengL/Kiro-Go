@@ -39,8 +39,12 @@ docker run -d \
   -e ADMIN_PASSWORD=your_secure_password \
   -v /path/to/data:/app/data \
   --restart unless-stopped \
+  --log-opt max-size=50m \
+  --log-opt max-file=5 \
   ghcr.io/quorinex/kiro-go:latest
 ```
+
+> `--log-opt` 限制容器日志最多 5 份 × 50MB；不加时默认 `json-file` driver 会无限增长。
 
 ### 源码编译
 

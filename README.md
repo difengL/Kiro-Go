@@ -39,8 +39,13 @@ docker run -d \
   -e ADMIN_PASSWORD=your_secure_password \
   -v /path/to/data:/app/data \
   --restart unless-stopped \
+  --log-opt max-size=50m \
+  --log-opt max-file=5 \
   ghcr.io/quorinex/kiro-go:latest
 ```
+
+> `--log-opt` caps container logs at 5 files × 50MB; without it the default
+> `json-file` driver grows without bound.
 
 ### Build from Source
 

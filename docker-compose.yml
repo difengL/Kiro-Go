@@ -10,3 +10,10 @@ services:
     environment:
       - CONFIG_PATH=/app/data/config.json
     restart: unless-stopped
+    # 容器日志轮转：单文件 50MB 后切分，最多保留 5 份（磁盘占用上限约 250MB）。
+    # 注意：logging 属于容器创建期配置，改动后需 `docker compose up -d` 重建容器才生效。
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"

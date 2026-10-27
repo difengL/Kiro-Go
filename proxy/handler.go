@@ -489,16 +489,17 @@ func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":          "ok",
-		"version":         config.Version,
-		"accounts":        h.pool.Count(),
-		"available":       h.pool.AvailableCount(),
-		"totalRequests":   atomic.LoadInt64(&h.totalRequests),
-		"successRequests": atomic.LoadInt64(&h.successRequests),
-		"failedRequests":  atomic.LoadInt64(&h.failedRequests),
-		"totalTokens":     atomic.LoadInt64(&h.totalTokens),
-		"totalCredits":    h.getCredits(),
-		"uptime":          time.Now().Unix() - h.startTime,
+		"status":           "ok",
+		"version":          config.Version,
+		"accounts":         h.pool.Count(),
+		"available":        h.pool.AvailableCount(),
+		"totalRequests":    atomic.LoadInt64(&h.totalRequests),
+		"successRequests":  atomic.LoadInt64(&h.successRequests),
+		"failedRequests":   atomic.LoadInt64(&h.failedRequests),
+		"totalTokens":      atomic.LoadInt64(&h.totalTokens),
+		"totalCredits":     h.getCredits(),
+		"availableCredits": availableCredits(),
+		"uptime":           time.Now().Unix() - h.startTime,
 	})
 }
 
@@ -3973,17 +3974,36 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// availableCredits 汇总所有可用账号本周期剩余主配额（usageLimit - usageCurrent）。
+// 已用额度达到或超过上限的账号贡献 0；禁用或封禁账号不计入。
+func availableCredits() float64 {
+	var total float64
+	for _, a := range config.GetAccounts() {
+		if !a.Enabled {
+			continue
+		}
+		if a.BanStatus != "" && a.BanStatus != "ACTIVE" {
+			continue
+		}
+		if remaining := a.UsageLimit - a.UsageCurrent; remaining > 0 {
+			total += remaining
+		}
+	}
+	return total
+}
+
 func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"version":         config.Version,
-		"accounts":        h.pool.Count(),
-		"available":       h.pool.AvailableCount(),
-		"totalRequests":   h.totalRequests,
-		"successRequests": h.successRequests,
-		"failedRequests":  h.failedRequests,
-		"totalTokens":     h.totalTokens,
-		"totalCredits":    h.totalCredits,
-		"uptime":          time.Now().Unix() - h.startTime,
+		"version":          config.Version,
+		"accounts":         h.pool.Count(),
+		"available":        h.pool.AvailableCount(),
+		"totalRequests":    h.totalRequests,
+		"successRequests":  h.successRequests,
+		"failedRequests":   h.failedRequests,
+		"totalTokens":      h.totalTokens,
+		"totalCredits":     h.totalCredits,
+		"availableCredits": availableCredits(),
+		"uptime":           time.Now().Unix() - h.startTime,
 	})
 }
 
@@ -4098,12 +4118,13 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) apiGetStats(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"totalRequests":   atomic.LoadInt64(&h.totalRequests),
-		"successRequests": atomic.LoadInt64(&h.successRequests),
-		"failedRequests":  atomic.LoadInt64(&h.failedRequests),
-		"totalTokens":     atomic.LoadInt64(&h.totalTokens),
-		"totalCredits":    h.getCredits(),
-		"uptime":          time.Now().Unix() - h.startTime,
+		"totalRequests":    atomic.LoadInt64(&h.totalRequests),
+		"successRequests":  atomic.LoadInt64(&h.successRequests),
+		"failedRequests":   atomic.LoadInt64(&h.failedRequests),
+		"totalTokens":      atomic.LoadInt64(&h.totalTokens),
+		"totalCredits":     h.getCredits(),
+		"availableCredits": availableCredits(),
+		"uptime":           time.Now().Unix() - h.startTime,
 	})
 }
 

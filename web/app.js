@@ -689,6 +689,7 @@
     $('statFailed').textContent = d.failedRequests || 0;
     $('statTokens').textContent = formatNum(d.totalTokens || 0);
     $('statCredits').textContent = (d.totalCredits || 0).toFixed(1);
+    $('statAvailableCredits').textContent = (d.availableCredits || 0).toFixed(1);
   }
 
   // ===== Logs =====

@@ -19,6 +19,7 @@
   "stats.errors": "Lỗi",
   "stats.tokens": "Tokens",
   "stats.credits": "Credits",
+  "stats.availableCredits": "Credits khả dụng",
   "stats.capacity": "Dung lượng",
   "stats.traffic": "Lưu lượng",
   "stats.reliability": "Độ tin cậy",

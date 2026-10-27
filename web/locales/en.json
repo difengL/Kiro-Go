@@ -19,6 +19,7 @@
   "stats.errors": "Errors",
   "stats.tokens": "Tokens",
   "stats.credits": "Credits",
+  "stats.availableCredits": "Available Credits",
   "stats.capacity": "Capacity",
   "stats.traffic": "Traffic",
   "stats.reliability": "Reliability",

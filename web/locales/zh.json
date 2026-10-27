@@ -19,6 +19,7 @@
   "stats.errors": "错误",
   "stats.tokens": "Tokens",
   "stats.credits": "Credits",
+  "stats.availableCredits": "可用 CREDIT",
   "stats.capacity": "容量",
   "stats.traffic": "流量",
   "stats.reliability": "稳定性",

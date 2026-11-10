@@ -350,6 +350,17 @@ func Load() error {
 			return err
 		}
 	}
+
+	// Migration: drop the retired Kiro IDE version pin. Older builds shipped
+	// (and some configs pinned) kiroVersion=0.11.107; upstream now rejects that
+	// version with 403 FEATURE_NOT_SUPPORTED, so fall back to the current
+	// default instead of keeping every request broken.
+	if cfg.KiroVersion == legacyKiroVersion {
+		cfg.KiroVersion = ""
+		if err := saveLocked(); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -1249,6 +1260,19 @@ func UpdateLogLevel(level string) error {
 	return Save()
 }
 
+// defaultKiroVersion is the Kiro IDE version reported in the upstream
+// User-Agent / x-amz-user-agent headers. Upstream enforces a minimum client
+// version and rejects older ones with HTTP 403
+// {"reason":"FEATURE_NOT_SUPPORTED","message":"This version of Kiro is no
+// longer supported..."}. Keep this in step with a current Kiro IDE release
+// (see https://kiro.dev/changelog/); it needs periodic bumping.
+const defaultKiroVersion = "1.4.121"
+
+// legacyKiroVersion was the built-in default before the upstream version gate
+// started rejecting it. Configs that pinned this value must be migrated to the
+// current default, otherwise every request keeps failing with 403.
+const legacyKiroVersion = "0.11.107"
+
 type KiroClientConfig struct {
 	KiroVersion   string
 	SystemVersion string
@@ -1259,7 +1283,7 @@ func GetKiroClientConfig() KiroClientConfig {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
 
-	kiroVersion := "0.11.107"
+	kiroVersion := defaultKiroVersion
 	if cfg != nil && cfg.KiroVersion != "" {
 		kiroVersion = cfg.KiroVersion
 	}
